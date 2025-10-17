@@ -1,6 +1,5 @@
 // websocket_client.cpp
-// C++11, google-ish style. Uses websocketpp (Boost.Asio + OpenSSL).
-// Build: see CMakeLists below.
+
 
 #include "mpmc_queue.h"
 
