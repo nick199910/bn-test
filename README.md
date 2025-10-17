@@ -39,7 +39,7 @@ binance-ws_test/
 
 
 
-## Archtect4re
+## Archtecture
 A comprehensive latency measurement system for WebSocket connections that correlates timestamps across three layers:
 
 NIC Layer (DPDK): Packet arrival at network card
