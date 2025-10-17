@@ -1,6 +1,5 @@
 // dpdk_capture.cpp
-// Simple example: initialize EAL, receive packets on port 0, timestamp and enqueue.
-// For production use: proper EAL args, port config, multiqueue, RSS, etc.
+
 
 #include "mpmc_queue.h"
 
