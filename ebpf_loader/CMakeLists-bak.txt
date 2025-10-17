@@ -1,0 +1,34 @@
+project(ebpf_loader C)
+find_library(LIBBPF libbpf.so)
+find_path(LIBBPF_INCLUDE_DIR bpf/libbpf.h PATHS /usr/include /usr/local/include)
+if (NOT LIBBPF)
+  message(WARNING "libbpf not found; ebpf loader will likely fail to link")
+endif()
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBBPF REQUIRED libbpf)
+
+include_directories(
+    ${LIBBPF_INCLUDE_DIRS}
+    /usr/include/bpf
+    /usr/include
+    /usr/include/x86_64-linux-gnu
+    /usr/src/linux-headers-6.14.0-33-generic/include
+    /usr/src/linux-headers-6.14.0-33-generic/arch/x86/include
+    /usr/src/linux-headers-6.14.0-33-generic/arch/x86/include/uapi
+    /usr/src/linux-headers-6.14.0-33-generic/include/uapi
+)
+
+link_directories(${LIBBPF_LIBRARY_DIRS})
+
+# Compile bpf_program.c to object using clang separately (recommended)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/bpf_program.o
+  COMMAND clang -O2 -g -target bpf -c ${CMAKE_CURRENT_SOURCE_DIR}/bpf_program.c -o ${CMAKE_CURRENT_BINARY_DIR}/bpf_program.o
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bpf_program.c
+)
+
+
+
+add_executable(ebpf_loader ebpf_loader.cpp ${CMAKE_CURRENT_BINARY_DIR}/bpf_program.o)
+target_include_directories(ebpf_loader PRIVATE ${LIBBPF_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ebpf_loader PRIVATE bpf pthread)

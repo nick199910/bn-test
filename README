@@ -1,0 +1,83 @@
+# Binance WebSocket Latency Analyzer (C++ + DPDK + eBPF)
+
+## 🧩 Overview
+
+This project demonstrates a **high-performance Binance market data receiver** built in modern **C++11** using:
+- **WebSocket++** for Binance market data streaming  
+- **DPDK** for kernel-bypass packet capture and zero-copy network optimization  
+- **eBPF** for kernel-level latency tracing and statistics  
+- **rigtorp::MPMCQueue** for lock-free multi-producer/multi-consumer event broadcasting between threads  
+
+The demo measures **WebSocket round-trip latency** in both **user space and kernel space**, showing how DPDK + eBPF instrumentation can be used to analyze network performance in real-time.
+
+---
+
+## 📦 Project Structure
+
+binance-ws_test/
+├── CMakeLists.txt # Top-level CMake configuration
+├── websocket_client/
+│ ├── websocket_client.cpp # Binance WebSocket client (using websocketpp)
+│ └── CMakeLists.txt
+├── dpdk_capture/
+│ ├── dpdk_capture.cpp # DPDK setup, zero-copy RX/TX, timestamping
+│ └── CMakeLists.txt
+├── ebpf_loader/
+│ ├── ebpf_loader.cpp # eBPF loader & latency probe via libbpf
+│ └── CMakeLists.txt
+├── include/
+│ ├── mpmc_queue.h # rigtorp MPMC queue for inter-thread broadcast
+│ ├── event.h # Event struct (shared_ptr used for MPMC)
+│ └── utils.h # Common utilities and logging
+└── tests/
+├── latency_test.cpp # Unit test for round-trip latency measurement
+└── CMakeLists.txt
+
+
+
+---
+
+## 🔧 Build Requirements
+
+### Dependencies
+
+| Component | Purpose | Install Command |
+|------------|----------|----------------|
+| **CMake ≥ 3.14** | Build system | `sudo apt install cmake` |
+| **Clang / GCC** | Compiler (C++11) | `sudo apt install clang` |
+| **Boost** | Asio dependency for WebSocket++ | `sudo apt install libboost-system-dev libboost-thread-dev` |
+| **WebSocket++** | WebSocket client | `sudo apt install libwebsocketpp-dev` |
+| **DPDK** | Kernel-bypass networking | [Install from source](https://github.com/DPDK/dpdk) |
+| **libbpf** | eBPF loader and tracing | `sudo apt install libbpf-dev` |
+| **Linux Kernel Headers** | For eBPF & DPDK | `sudo apt install linux-headers-$(uname -r)` |
+
+---
+
+## ⚙️ Build Instructions
+
+### 1. Clone and Initialize
+```bash
+git clone https://github.com/<yourusername>/binance-ws_test.git
+cd binance-ws_test
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### 🚀 Running the Demo
+## 1. Run the DPDK Capture
+```bash
+sudo ./build/dpdk_capture/dpdk_capture
+```
+
+## 2. Start the WebSocket Client
+```bash
+./build/websocket_client/websocket_client wss://fstream.binance.com:443/ws/stream
+```
+This connects to Binance Futures WebSocket stream and begins receiving market data.
+
+## 3. Start eBPF Latency Probe
+```bash
+sudo ./build/ebpf_loader/ebpf_loader
+```
+This attaches kernel probes to the socket stack and measures latency from packet arrival to user-space message handling.

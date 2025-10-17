@@ -1,0 +1,23 @@
+project(dpdk_capture)
+# find_path(RTE_INCLUDE rte_eal.h /usr/include/dpdk)
+
+set(RTE_INCLUDE /usr/local/include/dpdk)
+set(RTE_LIB /usr/local/lib)
+
+link_directories(${RTE_LIB})
+include_directories(
+    ${RTE_INCLUDE}
+    ${CMAKE_SOURCE_DIR}/websocket_client
+    /usr/include/x86_64-linux-gnu
+    /usr/src/linux-headers-6.14.0-33-generic/include
+    /usr/src/linux-headers-6.14.0-33-generic/arch/x86/include
+    /usr/src/linux-headers-6.14.0-33-generic/arch/x86/include/uapi
+    /usr/src/linux-headers-6.14.0-33-generic/include/uapi
+)
+
+# Adjust DPDK include/library paths per your install.
+add_executable(dpdk_capture dpdk_capture.cpp)
+target_include_directories(dpdk_capture PRIVATE ${RTE_INCLUDE})
+# You will need to add required DPDK link flags. Users typically use `pkg-config --cflags --libs libdpdk`.
+# Example:
+# target_link_libraries(dpdk_capture PRIVATE ${RTE_LIBS})
