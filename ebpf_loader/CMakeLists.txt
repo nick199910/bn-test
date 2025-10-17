@@ -11,6 +11,7 @@ execute_process(COMMAND uname -r OUTPUT_VARIABLE KVER OUTPUT_STRIP_TRAILING_WHIT
 # ---------------------------------------------
 include_directories(
     ${LIBBPF_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/websocket_client
     /usr/include/bpf
     /usr/include
     /usr/include/x86_64-linux-gnu
@@ -57,8 +58,25 @@ add_custom_target(bpf_program_build DEPENDS ${BPF_OBJ})
 add_executable(ebpf_loader ${CMAKE_CURRENT_SOURCE_DIR}/ebpf_loader.cpp)
 add_dependencies(ebpf_loader bpf_program_build)
 
-target_include_directories(ebpf_loader PRIVATE ${LIBBPF_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(ebpf_loader PRIVATE ${LIBBPF_LIBRARIES} pthread)
+target_include_directories(ebpf_loader PRIVATE 
+  ${LIBBPF_INCLUDE_DIRS} 
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(ebpf_loader PRIVATE 
+    ${LIBBPF_LIBRARIES}
+    pthread 
+    elf 
+    z 
+    rt
+)
+
+
+target_compile_options(ebpf_loader PRIVATE -Wall -Wextra -O3)
+
+install(TARGETS ebpf_loader RUNTIME DESTINATION bin)
+install(FILES  ${BPF_OBJ}
+        DESTINATION share/ws-profiler)
 
 
 

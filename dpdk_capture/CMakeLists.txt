@@ -41,6 +41,8 @@ target_compile_definitions(dpdk_capture PRIVATE _GNU_SOURCE)
 # Use -mssse3; if you prefer automatic tuning on the build host use -march=native instead.
 target_compile_options(dpdk_capture PRIVATE -mssse3)
 
+install(TARGETS dpdk_capture RUNTIME DESTINATION bin)
+
 # (Optional) also enable other common x86 vector extensions if your DPDK install expects them:
 # target_compile_options(dpdk_capture PRIVATE -msse4.1)
 
@@ -55,3 +57,5 @@ else()
         rte_ethdev
     )
 endif()
+
+
