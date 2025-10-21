@@ -26,6 +26,8 @@ struct CorrelatedEvent {
   uint64_t ts_nic_ns;
   uint64_t ts_kernel_ns;
   uint64_t ts_userspace_ns;
+  uint64_t ts_cpu_deserialization; // CPU deserialization time (bn-marketdata.ts - ts_userspace_ns)
+  uint64_t ts_network_ns; // Network time (BN->NIC) (bn-marketdata.ts - ts_nic_ns)
   uint64_t seq_no;
   uint32_t tcp_seq;
   uint64_t sock_ptr;
@@ -42,10 +44,18 @@ struct CorrelatedEvent {
   uint64_t latency_nic_to_user() const {
     return (ts_userspace_ns > ts_nic_ns) ? (ts_userspace_ns - ts_nic_ns) : 0;
   }
+
+  uint64_t latency_network_to_nic() const {
+    return (ts_nic_ns > ts_network_ns) ? (ts_nic_ns - ts_network_ns) : 0;
+  }
+
+  uint64_t latency_cpu_deserialization() const {
+    return (ts_cpu_deserialization > ts_userspace_ns) ? (ts_cpu_deserialization - ts_userspace_ns) : 0;
+  }   
   
   bool is_complete() const {
-    return ts_nic_ns > 0 && ts_kernel_ns > 0 && ts_userspace_ns > 0;
-  }
+    return ts_nic_ns > 0 && ts_kernel_ns > 0 && ts_userspace_ns > 0 && ts_cpu_deserialization > 0 && ts_network_ns > 0;
+  } 
 };
 
 class EventCorrelator {
@@ -95,6 +105,9 @@ public:
               corr.ts_nic_ns = nic_ev.ts_nic_ns;
               corr.ts_kernel_ns = kern_ev.ts_kernel_ns;
               corr.ts_userspace_ns = user_ev.ts_userspace_ns;
+              // Userspace absolute deserialization end and BN send ts from user event
+              corr.ts_cpu_deserialization = user_ev.ts_cpu_deserialization;
+              corr.ts_network_ns = user_ev.src_send_ts_ns; // BN send ts (absolute); BN->NIC = ts_nic_ns - src_send_ts_ns
               corr.seq_no = user_ev.seq_no;
               corr.tcp_seq = nic_ev.tcp_seq;
               corr.sock_ptr = kern_ev.sock_ptr;
@@ -198,7 +211,9 @@ private:
               << " tcp_seq=" << ev.tcp_seq
               << " NIC->Kernel=" << (ev.latency_nic_to_kernel() / 1000) << "us"
               << " Kernel->User=" << (ev.latency_kernel_to_user() / 1000) << "us"
-              << " Total=" << (ev.latency_nic_to_user() / 1000) << "us\n";
+              << " Total=" << (ev.latency_nic_to_user() / 1000) << "us"
+              << " BN->NIC=" << (ev.latency_network_to_nic() / 1000) << "us"
+              << " CPU(deser)=" << (ev.latency_cpu_deserialization() / 1000) << "us\n";
   }
 };
 

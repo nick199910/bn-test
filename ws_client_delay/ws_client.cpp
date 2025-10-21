@@ -18,6 +18,7 @@
 #include <websocketpp/client.hpp>
 #include <openssl/ssl.h>
 #include <boost/asio/ssl.hpp>
+#include <simdjson.h>
 
 typedef websocketpp::config::asio_tls_client tls_client_config;
 typedef websocketpp::client<tls_client_config> client_t;
@@ -83,6 +84,8 @@ struct CorrelatedEvent {
   uint64_t ts_nic_ns{0};
   uint64_t ts_kernel_ns{0};
   uint64_t ts_userspace_ns{0};
+  uint64_t ts_cpu_deser_end_ns{0};
+  uint64_t src_send_ts_ns{0};
   uint64_t seq_no{0};
   uint32_t tcp_seq{0};
   uint64_t sock_ptr{0};
@@ -96,6 +99,12 @@ struct CorrelatedEvent {
   }
   uint64_t latency_nic_to_user() const {
     return (ts_userspace_ns > ts_nic_ns) ? (ts_userspace_ns - ts_nic_ns) : 0;
+  }
+  uint64_t latency_cpu_deser() const {
+    return (ts_cpu_deser_end_ns > ts_userspace_ns) ? (ts_cpu_deser_end_ns - ts_userspace_ns) : 0;
+  }
+  uint64_t latency_bn_to_nic() const {
+    return (ts_nic_ns > src_send_ts_ns && src_send_ts_ns > 0) ? (ts_nic_ns - src_send_ts_ns) : 0;
   }
   bool is_complete() const {
     return ts_nic_ns > 0 && ts_kernel_ns > 0 && ts_userspace_ns > 0;
@@ -177,22 +186,33 @@ public:
         ce.ts_userspace_ns = ue.ts_userspace_ns;
         ce.ts_kernel_ns = best_k.ts_kernel_ns;
         ce.ts_nic_ns = has_n ? best_n.ts_nic_ns : 0;
+        ce.ts_cpu_deser_end_ns = ue.ts_cpu_deserialization;
+        ce.src_send_ts_ns = ue.src_send_ts_ns;
         ce.seq_no = ue.seq_no;
         ce.tcp_seq = ue.tcp_seq ? ue.tcp_seq : best_k.tcp_seq;
         ce.sock_ptr = ue.sock_ptr ? ue.sock_ptr : best_k.sock_ptr;
         ce.sock_fd = ue.sock_fd;
 
-        // 使用 SPDLogger 输出日志，统一三段：NIC->Kernel、Kernel->User、Total（无 NIC 时为 N/A）
+        // 输出四段：BN->NIC、NIC->Kernel、Kernel->User、CPU(反序列化)；
+        // Total 定义为 NIC->Kernel + Kernel->User + CPU
         auto nk = has_n ? fmt::format("{}us", ce.latency_nic_to_kernel() / 1000) : std::string("N/A");
         auto ku = fmt::format("{}us", ce.latency_kernel_to_user() / 1000);
-        auto nt = has_n ? fmt::format("{}us", ce.latency_nic_to_user() / 1000) : std::string("N/A");
+        auto cpu = fmt::format("{}us", ce.latency_cpu_deser() / 1000);
+        // per-message 偏移 K（epoch - steady），将 NIC 的 steady 对齐到 Epoch 再与 E 相减
+        uint64_t K = (ue.ts_userspace_epoch_ns > ue.ts_userspace_ns) ? (ue.ts_userspace_epoch_ns - ue.ts_userspace_ns) : 0;
+        uint64_t bn_nic_ns = (has_n && ue.src_send_ts_ns > 0 && K > 0) ? ((ce.ts_nic_ns + K) - ue.src_send_ts_ns) : 0;
+        auto bn_nic = has_n && bn_nic_ns > 0 ? fmt::format("{}us", bn_nic_ns / 1000) : std::string("N/A");
+        uint64_t total_with_cpu_ns = ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser();
+        auto total = has_n ? fmt::format("{}us", total_with_cpu_ns / 1000) : std::string("N/A");
         logger_->info(
-          "[delay] seq={} tcp_seq={} NIC->Kernel={} Kernel->User={} Total={}",
+          "[delay] seq={} tcp_seq={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} Total={}",
           ce.seq_no,
           ce.tcp_seq,
+          bn_nic,
           nk,
           ku,
-          nt);
+          cpu,
+          total);
       }
     }
 
@@ -256,16 +276,68 @@ int main(int argc, char** argv) {
     con->send(sub);
   });
 
-  // 消息回调：写入用户态事件到共享队列
+  // 消息回调：写入用户态事件到共享队列（解析 BN 服务器时间与反序列化耗时）
   ws_client.set_message_handler([logger](websocketpp::connection_hdl, client_t::message_ptr msg) {
-    uint64_t user_ts = static_cast<uint64_t>(
+    // 回调进入时刻（用户态起点）
+    uint64_t ts_userspace_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            steady_clock::now().time_since_epoch()).count());
+    uint64_t ts_userspace_epoch_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // 解析 BN 发送时间（优先 data.E, 次选 E，再次选 data.T/T），单位通常为毫秒
+    uint64_t src_send_ts_ns = 0;
+    {
+      simdjson::dom::parser parser;
+      simdjson::padded_string pj{msg->get_payload()};
+      auto doc_res = parser.parse(pj);
+      if (doc_res.error() == simdjson::SUCCESS) {
+        simdjson::dom::element doc = doc_res.value();
+        auto get_uint = [](simdjson::dom::element elem, const char* key, uint64_t& out)->bool{
+          auto v = elem[key];
+          if (v.error() == simdjson::SUCCESS) {
+            uint64_t tmp{}; if (v.get(tmp) == simdjson::SUCCESS) { out = tmp; return true; }
+          }
+          return false;
+        };
+        uint64_t e_ms = 0;
+        bool found = false;
+        // combined stream
+        auto data = doc["data"];
+        if (!found && data.error() == simdjson::SUCCESS) {
+          simdjson::dom::element de = data.value();
+          if (get_uint(de, "E", e_ms)) { found = true; }
+          else if (get_uint(de, "T", e_ms)) { found = true; }
+        }
+        // single stream
+        if (!found) {
+          if (get_uint(doc, "E", e_ms)) { found = true; }
+          else if (get_uint(doc, "T", e_ms)) { found = true; }
+        }
+        if (found) {
+          src_send_ts_ns = e_ms * 1000000ULL; // ms -> ns
+        }
+        // 调试日志：打印解析结果与 payload 前缀
+        std::string prefix = msg->get_payload().substr(0, 120);
+        logger->info("[parse] found_ts={} e_ms={} payload_prefix=\"{}\"", found ? 1 : 0, (unsigned long long)e_ms, prefix);
+      } else {
+        logger->warn("[parse] simdjson parse error: {}", simdjson::error_message(doc_res.error()));
+      }
+    }
+
+    // 反序列化完成时刻（这里只在 JSON 解析完成后作为结束时间）
+    uint64_t ts_after_deser_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             steady_clock::now().time_since_epoch()).count());
 
     UnifiedEvent ev{};
     ev.type = EVENT_TYPE_USERSPACE;
     ev.seq_no = g_seq_no.fetch_add(1);
-    ev.ts_userspace_ns = user_ts;
+    ev.ts_userspace_ns = ts_userspace_ns;
+    ev.ts_userspace_epoch_ns = ts_userspace_epoch_ns;
+    ev.ts_cpu_deserialization = ts_after_deser_ns; // 绝对时间，相关器内再做差
+    ev.src_send_ts_ns = src_send_ts_ns;            // BN 发送时间（绝对）
     ev.ts_kernel_ns = 0;
     ev.ts_nic_ns = 0;
     ev.sock_fd = g_websocket_fd;
@@ -281,8 +353,6 @@ int main(int argc, char** argv) {
       logger->warn("[ws] queue full, dropped event");
     }
   });
-
-  // 取消 RTT 测量：不设置 pong 回调
 
   // Connect
   websocketpp::lib::error_code ec;

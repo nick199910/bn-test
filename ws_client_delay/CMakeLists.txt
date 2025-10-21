@@ -20,6 +20,18 @@ if (NOT spdlog_FOUND)
   FetchContent_MakeAvailable(spdlog)
 endif()
 
+# simdjson: header-only with small static lib. Try config, fallback to FetchContent.
+find_package(simdjson CONFIG QUIET)
+if (NOT simdjson_FOUND)
+  message(STATUS "simdjson not found in system. Falling back to FetchContent...")
+  FetchContent_Declare(
+    simdjson
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG v3.9.1
+  )
+  FetchContent_MakeAvailable(simdjson)
+endif()
+
 # websocketpp is header-only: expect it installed in system include path
 add_executable(ws_client_delay ws_client.cpp)
 
@@ -36,6 +48,7 @@ target_link_libraries(ws_client_delay PRIVATE
   rt
 )
 target_link_libraries(ws_client_delay PRIVATE spdlog::spdlog)
+target_link_libraries(ws_client_delay PRIVATE simdjson::simdjson)
 
 target_compile_options(ws_client_delay PRIVATE -Wall -Wextra -O3)
 

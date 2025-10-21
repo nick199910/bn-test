@@ -30,6 +30,9 @@ struct UnifiedEvent {
   uint64_t ts_nic_ns;         // NIC RX timestamp (DPDK)
   uint64_t ts_kernel_ns;      // Kernel receive timestamp (eBPF)
   uint64_t ts_userspace_ns;   // User-space receive timestamp
+  uint64_t ts_userspace_epoch_ns; // User-space receive timestamp in epoch ns (system_clock)
+  uint64_t ts_cpu_deserialization; // Userspace deserialization end timestamp (absolute)
+  uint64_t src_send_ts_ns;    // Exchange send timestamp from WS payload (absolute, ns)
   
   // Correlation fields
   int32_t sock_fd;            // Socket file descriptor
