@@ -1,10 +1,5 @@
-<<<<<<< HEAD
-// dpdk_capture.cpp
-
-=======
 // dpdk_capture_fixed.cpp
 // DPDK capture with proper TSC conversion and packet parsing
->>>>>>> 14deda0 (dpdk_capture_fixed.cpp)
 
 #include "shared_events.h"
 
@@ -123,11 +118,46 @@ int main(int argc, char** argv) {
   }
   
   std::cout << "[dpdk] Using port " << port_id << " (" << dev_info.driver_name << ")\n";
-  
+ 
+  // 创建 MBUF 内存池
+  const unsigned nb_mbufs = 8192;
+  const unsigned mbuf_cache = 256;
+  rte_mempool* mbuf_pool = rte_pktmbuf_pool_create(
+      "MBUF_POOL", nb_mbufs, mbuf_cache, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  if (!mbuf_pool) {
+    std::cerr << "Failed to create mbuf pool\n";
+    return 1;
+  }
+
+  // 配置端口（1 个 RX 队列、0 个 TX 队列）
+  rte_eth_conf port_conf{};
+  port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+  ret = rte_eth_dev_configure(port_id, 1 /*rx*/, 0 /*tx*/, &port_conf);
+  if (ret < 0) {
+    std::cerr << "Failed to configure port\n";
+    return 1;
+  }
+
+  // 设置 RX 队列
+  const uint16_t rx_desc = 512;
+  ret = rte_eth_rx_queue_setup(port_id, 0, rx_desc, rte_eth_dev_socket_id(port_id), nullptr, mbuf_pool);
+  if (ret < 0) {
+    std::cerr << "Failed to setup rx queue\n";
+    return 1;
+  }
+
+  // 启动端口
+  ret = rte_eth_dev_start(port_id);
+  if (ret < 0) {
+    std::cerr << "Failed to start device\n";
+    return 1;
+  }
+  rte_eth_promiscuous_enable(port_id);
+
   const uint16_t burst_size = 32;
   rte_mbuf* bufs[burst_size];
   double tsc_hz = rte_get_tsc_hz();
-  
+ 
   std::cout << "[dpdk] TSC frequency: " << (tsc_hz / 1e9) << " GHz\n";
   std::cout << "[dpdk] Capturing packets... (Ctrl+C to stop)\n";
   
@@ -202,7 +232,8 @@ int main(int argc, char** argv) {
   
   std::cout << "\n[dpdk] shutting down...\n";
   std::cout << "[dpdk] total packets: " << total_packets << ", TCP: " << total_tcp << "\n";
-  
+  rte_eth_dev_stop(port_id);
+  rte_eth_dev_close(port_id);
   rte_eal_cleanup();
   return 0;
 }

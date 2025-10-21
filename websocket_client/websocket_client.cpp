@@ -1,7 +1,5 @@
 // websocket_client.cpp
 
-
-#include "mpmc_queue.h"
 #include "shared_events.h"
 
 #include <chrono>

@@ -16,6 +16,7 @@ add_subdirectory(websocket_client)
 add_subdirectory(ebpf_loader)
 add_subdirectory(dpdk_capture)
 add_subdirectory(event_correlator)
+add_subdirectory(ws_client_delay)
 
 
 # Print build information
