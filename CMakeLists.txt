@@ -12,10 +12,8 @@ include_directories(${Boost_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 
-add_subdirectory(websocket_client)
 add_subdirectory(ebpf_loader)
 add_subdirectory(dpdk_capture)
-add_subdirectory(event_correlator)
 add_subdirectory(ws_client_delay)
 add_subdirectory(normal_ws)
 
