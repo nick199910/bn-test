@@ -17,6 +17,7 @@ add_subdirectory(ebpf_loader)
 add_subdirectory(dpdk_capture)
 add_subdirectory(event_correlator)
 add_subdirectory(ws_client_delay)
+add_subdirectory(normal_ws)
 
 
 # Print build information

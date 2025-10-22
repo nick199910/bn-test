@@ -21,9 +21,16 @@ if (NOT spdlog_FOUND)
 endif()
 
 # RapidJSON: header-only JSON library
-find_package(RapidJSON CONFIG QUIET)
-if (NOT RapidJSON_FOUND)
+find_path(RAPIDJSON_INCLUDE_DIRS "rapidjson/document.h"
+  PATHS /usr/local/include /usr/include
+  NO_DEFAULT_PATH
+)
+
+if (NOT RAPIDJSON_INCLUDE_DIRS)
   message(STATUS "RapidJSON not found in system. Falling back to FetchContent...")
+  set(RAPIDJSON_BUILD_DOC OFF CACHE BOOL "" FORCE)
+  set(RAPIDJSON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(RAPIDJSON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
     rapidjson
     GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
@@ -32,16 +39,17 @@ if (NOT RapidJSON_FOUND)
   FetchContent_MakeAvailable(rapidjson)
   set(RAPIDJSON_INCLUDE_DIRS ${rapidjson_SOURCE_DIR}/include)
 else()
-  set(RAPIDJSON_INCLUDE_DIRS ${RapidJSON_INCLUDE_DIRS})
+  message(STATUS "RapidJSON found at: ${RAPIDJSON_INCLUDE_DIRS}")
 endif()
 
-# rdkafka: Kafka C/C++ client library
+# rdkafka: Kafka C/C++ client library (optional)
 find_package(RdKafka CONFIG QUIET)
 if (NOT RdKafka_FOUND)
-  message(STATUS "RdKafka not found in system. Please install librdkafka-dev")
-  message(STATUS "  Ubuntu/Debian: sudo apt-get install librdkafka-dev")
-  message(STATUS "  macOS: brew install librdkafka")
-  message(FATAL_ERROR "RdKafka is required but not found")
+  message(STATUS "RdKafka not found in system. Building without Kafka support.")
+  message(STATUS "  To enable Kafka: sudo apt-get install librdkafka-dev")
+  set(HAVE_RDKAFKA FALSE)
+else()
+  set(HAVE_RDKAFKA TRUE)
 endif()
 
 # websocketpp is header-only: expect it installed in system include path
@@ -59,13 +67,23 @@ target_link_libraries(binance_market_nologger PRIVATE
   Threads::Threads
   OpenSSL::SSL
   OpenSSL::Crypto
-  RdKafka::rdkafka
-  RdKafka::rdkafka++
   rt
+  spdlog::spdlog
 )
-target_link_libraries(binance_market_nologger PRIVATE spdlog::spdlog)
 
-target_compile_options(binance_market_nologger PRIVATE -Wall -Wextra -O3)
+# Link rdkafka only if found
+if(HAVE_RDKAFKA)
+  target_link_libraries(binance_market_nologger PRIVATE
+    RdKafka::rdkafka
+    RdKafka::rdkafka++
+  )
+  target_compile_definitions(binance_market_nologger PRIVATE HAVE_RDKAFKA)
+endif()
+
+target_compile_options(binance_market_nologger PRIVATE 
+  -Wall -Wextra -O3
+  -Wno-class-memaccess  # Ignore RapidJSON memcpy warnings
+)
 
 # 如果定义了 EVN_JAPAN 环境变量，添加编译定义
 if(DEFINED ENV{EVN_JAPAN})

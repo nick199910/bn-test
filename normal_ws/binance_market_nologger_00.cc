@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <atomic>
+#include <csignal>
 #include <x86intrin.h>
 
 #include <websocketpp/config/asio_client.hpp>
@@ -15,15 +16,39 @@
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 
-#include "util/kafka_producer.h"
-#include "util/time.h"
+// #include "util/time.h"  // Not needed - using standard chrono instead
+
+// Define GET_CURRENT_TIME macro for timestamp
+#define GET_CURRENT_TIME() (std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count())
+
+#ifdef HAVE_RDKAFKA
+// Kafka producer would be included here if available
+// #include "util/kafka_producer.h"
+#warning "Kafka support enabled but kafka_producer.h not available"
+#endif
 
 using websocketpp::connection_hdl;
+using steady_clock = std::chrono::steady_clock;
 
 // 延迟测试配置
-const int MAX_MESSAGES = 20;  // 只接收20条数据
 std::atomic<int> message_count(0);
 std::atomic<bool> should_stop(false);  // 停止标志
+
+// 前向声明
+typedef websocketpp::client<websocketpp::config::asio_tls_client> client;
+client* g_client_ptr = nullptr;
+
+// 信号处理函数
+void signal_handler(int signal) {
+  if (signal == SIGINT) {
+    std::cout << "\n[signal] Caught SIGINT (Ctrl+C), exiting..." << std::endl;
+    should_stop.store(true);
+    // 主动停止 WebSocket 客户端
+    if (g_client_ptr) {
+      g_client_ptr->stop();
+    }
+  }
+}
 
 // 自动检测CPU频率（GHz）
 double get_cpu_freq_ghz() {
@@ -41,8 +66,7 @@ double get_cpu_freq_ghz() {
 
 double CPU_FREQ_GHZ = get_cpu_freq_ghz();
 
-// WebSocket 客户端类型
-typedef websocketpp::client<websocketpp::config::asio_tls_client> client;
+// TLS context 类型
 typedef websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context> context_ptr;
 
 std::string fmtSymbol(std::string s) {
@@ -53,6 +77,9 @@ std::string fmtSymbol(std::string s) {
 class BinanceWebSocket {
 public:
   BinanceWebSocket() {
+    // 设置全局指针，供信号处理使用
+    g_client_ptr = &m_client;
+    
     m_client.set_access_channels(websocketpp::log::alevel::all);
     m_client.clear_access_channels(websocketpp::log::alevel::frame_payload);
 
@@ -80,16 +107,21 @@ public:
 
     std::string brokers = "b-1.marketprice.ha3uq3.c5.kafka.ap-southeast-1.amazonaws.com:9092,b-2.marketprice.ha3uq3.c5.kafka.ap-southeast-1.amazonaws.com:9092,b-3.marketprice.ha3uq3.c5.kafka.ap-southeast-1.amazonaws.com:9092";
     std::string swapTopic = "swapBbo";
+#ifdef HAVE_RDKAFKA
     m_swapProducer = std::make_shared<CKafkaProducer>(brokers, swapTopic);
-	  if (!m_swapProducer.get()) {
-      printf("kafka auto share fail");
+    if (!m_swapProducer.get()) {
+      m_logger->error("[Kafka] Failed to create producer");
       return;
     }
 
     if (0 != m_swapProducer->Create()) {
-      printf("kafka create fail");
-	    return;
-	  }
+      m_logger->error("[Kafka] Failed to initialize producer");
+    }
+#else
+    m_logger->info("[Kafka] Support disabled at compile time");
+    (void)brokers; (void)swapTopic;  // Suppress unused warnings
+#endif
+    return;
   }
 
   context_ptr on_tls_init(const char * hostname, websocketpp::connection_hdl) {
@@ -155,8 +187,7 @@ public:
     std::string subscribe_message = R"({
         "method": "SUBSCRIBE",
         "params": [
-            "btcusdt@bookTicker",
-            "ethusdt@bookTicker"
+            "btcusdt@bookTicker"
         ],
         "id": 1
     })";
@@ -179,22 +210,19 @@ public:
 
   // 处理消息
   void on_message(connection_hdl hdl, client::message_ptr msg) {
-    // 如果已经达到限制，直接返回不处理
+    // 如果收到停止信号，直接返回
     if (should_stop.load()) {
       return;
     }
     
-    // 提前检查，避免超过限制
-    int current_count = message_count.load();
-    if (current_count >= MAX_MESSAGES) {
-      return;
-    }
-    
-    // 📍 开始计时 - 接收到数据
+    // 📍 开始计时 - 接收到数据（使用 steady_clock，与 ws_client_delay 一致）
     uint64_t t_start = __rdtsc();
-    
-    // payload: {"e":"bookTicker","u":7016077745944,"s":"ETHUSDT","b":"1896.65","B":"99.579","a":"1896.66","A":"190.561","T":1741867464776,"E":1741867464776}
-    long nowns = GET_CURRENT_TIME();
+    uint64_t ts_userspace_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            steady_clock::now().time_since_epoch()).count());
+    uint64_t ts_userspace_epoch_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
 
     try {
       char* json = (char*)msg->get_payload().c_str();
@@ -208,8 +236,8 @@ public:
         double bidPrice = stod(std::string(doc["b"].GetString()));
         double bidVolume = stod(std::string(doc["B"].GetString()));
         long updateID = doc["u"].GetInt64();
-        long eTime = doc["E"].GetInt64() * 1000000;
-        long tTime = doc["T"].GetInt64() * 1000000;
+        uint64_t eTime_ns = doc["E"].GetInt64() * 1000000ULL;  // 毫秒转纳秒
+        uint64_t tTime_ns = doc["T"].GetInt64() * 1000000ULL;  // 毫秒转纳秒
 
         // 生成日志上报
         rapidjson::Document frame;
@@ -229,16 +257,17 @@ public:
           rapidjson::Value reportData(rapidjson::kObjectType);
           reportData.AddMember("symbol", rapidjson::Value(symbol.c_str(), allocator), allocator);
           reportData.AddMember("contractType", rapidjson::Value("swap", allocator), allocator);
-          reportData.AddMember("exchangeTime", tTime, allocator);
+          reportData.AddMember("exchangeTime", tTime_ns, allocator);
           reportData.AddMember("bid1", bidPrice, allocator);
-          reportData.AddMember("bid1Volume", bidVolume, allocator);
+          reportData.AddMember("bid1Volume", rapidjson::Value(std::to_string(bidVolume).c_str(), allocator), allocator);
           reportData.AddMember("ask1", askPrice, allocator);
-          reportData.AddMember("ask1Volume", askVolume, allocator);
-          reportData.AddMember("now", nowns, allocator);
+          reportData.AddMember("ask1Volume", rapidjson::Value(std::to_string(askVolume).c_str(), allocator), allocator);
+          reportData.AddMember("eventTime", rapidjson::Value(std::to_string(tTime_ns).c_str(), allocator), allocator);
+          reportData.AddMember("now", ts_userspace_ns, allocator);
           frame.AddMember("pbpropv0", reportData, allocator);
         }
         frame.AddMember("server", rapidjson::Value("rapidjsonback", allocator), allocator);
-        frame.AddMember("time", rapidjson::Value(std::to_string(nowns/1000000).c_str(), allocator), allocator);
+        frame.AddMember("time", rapidjson::Value(std::to_string(ts_userspace_ns/1000000).c_str(), allocator), allocator);
         frame.AddMember("type", rapidjson::Value("binance_ws_cc", allocator), allocator);
         frame.AddMember("uid", rapidjson::Value("-1", allocator), allocator);
         frame.AddMember("version", rapidjson::Value("-1", allocator), allocator);
@@ -253,7 +282,7 @@ public:
         rapidjson::Document kafkaFrame;
         kafkaFrame.SetObject();
         rapidjson::Document::AllocatorType& kallocator = kafkaFrame.GetAllocator();
-        kafkaFrame.AddMember("bornTimestamp", rapidjson::Value(std::to_string(nowns/1000000).c_str(), kallocator), kallocator); 
+        kafkaFrame.AddMember("bornTimestamp", rapidjson::Value(std::to_string(ts_userspace_ns/1000000).c_str(), kallocator), kallocator); 
         {
           rapidjson::Value bboKafkaMsg(rapidjson::kObjectType);
           bboKafkaMsg.AddMember("symbol", rapidjson::Value(symbol.c_str(), kallocator), kallocator);
@@ -262,7 +291,7 @@ public:
   #else
           bboKafkaMsg.AddMember("exchange", rapidjson::Value("WSCC-BN", kallocator), kallocator);
   #endif
-          bboKafkaMsg.AddMember("ts", tTime, kallocator);
+          bboKafkaMsg.AddMember("ts", tTime_ns, kallocator);
           bboKafkaMsg.AddMember("ask1Price", askPrice, kallocator);
           bboKafkaMsg.AddMember("ask1Volume", askVolume, kallocator);
           bboKafkaMsg.AddMember("bid1Price", bidPrice, kallocator);
@@ -281,32 +310,30 @@ public:
         rapidjson::Writer<rapidjson::StringBuffer> kwriter(kbuffer);
         kafkaFrame.Accept(kwriter);
 
-        std::string bboKafkaRawKey = std::string(symbol) + std::string(":WSCC-BN:") + std::to_string(nowns/1000000);
+        std::string bboKafkaRawKey = std::string(symbol) + std::string(":WSCC-BN:") + std::to_string(ts_userspace_ns/1000000);
         std::string bboKafkaRawMsg = std::string(kbuffer.GetString());
+#ifdef HAVE_RDKAFKA
         m_swapProducer->PushMessage(bboKafkaRawMsg, bboKafkaRawKey);
+#else
+        (void)bboKafkaRawMsg; (void)bboKafkaRawKey;  // Suppress unused warnings
+#endif
         
         // 📍 结束计时 - 数据已发送
         uint64_t t_end = __rdtsc();
         uint64_t cycles = t_end - t_start;
-        double local_latency_us = cycles / (CPU_FREQ_GHZ * 1000.0);  // 本地处理延迟（微秒）
+        uint64_t local_latency_ns = static_cast<uint64_t>(cycles / CPU_FREQ_GHZ);  // 本地处理延迟（纳秒）
         
-        // 计算端到端延迟（网络+处理）
-        double total_latency_ms = (nowns - tTime) / 1000000.0;  // 转换为毫秒
-        double network_latency_ms = total_latency_ms - (local_latency_us / 1000.0);  // 网络延迟（毫秒）
+        // 计算延迟（所有单位：纳秒）
+        // 注意：需要使用 epoch 时间（system_clock）与 BN 的 epoch 时间比较
+        uint64_t bn_to_local_ns = ts_userspace_epoch_ns > eTime_ns ? (ts_userspace_epoch_ns - eTime_ns) : 0;
+        uint64_t total_with_cpu_ns = bn_to_local_ns + local_latency_ns;
         
         // 增加计数器
         int count = ++message_count;
         
-        // 使用spdlog打印延迟信息（JSON格式，便于后续分析）
-        spdlog::info("{{\"seq\":{},\"symbol\":\"{}\",\"local_us\":{:.2f},\"network_ms\":{:.2f},\"total_ms\":{:.2f},\"exchange_ts\":{},\"receive_ts\":{}}}", 
-                     count, symbol, local_latency_us, network_latency_ms, total_latency_ms, tTime/1000000, nowns/1000000);
-        
-        // 达到20条后停止
-        if (count >= MAX_MESSAGES) {
-          should_stop.store(true);  // 设置停止标志
-          spdlog::info("=== 测试完成，接收了 {} 条数据 ===", MAX_MESSAGES);
-          m_client.stop();
-        }
+        // 使用spdlog打印延迟信息（纳秒单位，与 ws_client_delay 一致）
+        spdlog::info("{{\"seq\":{},\"symbol\":\"{}\",\"BN->Local\":{}ns,\"CPU\":{}ns,\"Total\":{}ns,\"exchange_ts\":{},\"receive_ts\":{}}}", 
+                     count, symbol, bn_to_local_ns, local_latency_ns, total_with_cpu_ns, eTime_ns, ts_userspace_epoch_ns);
       }
     } catch (const std::exception& e) {
       std::cerr << "process payload fail: " << e.what() << ", payload: " << msg->get_payload() << std::endl;
@@ -316,10 +343,15 @@ public:
 private:
   client m_client;
   std::shared_ptr<spdlog::logger> m_logger;
+#ifdef HAVE_RDKAFKA
   std::shared_ptr<CKafkaProducer> m_swapProducer;
+#endif
 };
 
 int main() {
+  // 注册信号处理函数
+  signal(SIGINT, signal_handler);
+  
   // 配置spdlog：只输出到控制台
   auto console_logger = spdlog::stdout_color_mt("console");
   spdlog::set_default_logger(console_logger);
@@ -328,8 +360,9 @@ int main() {
   // 打印CPU频率和优化信息
   spdlog::info("=== 延迟测试启动 ===");
   spdlog::info("检测到的CPU频率: {:.2f} GHz", CPU_FREQ_GHZ);
-  spdlog::info("将接收 {} 条数据后自动退出", MAX_MESSAGES);
+  spdlog::info("Press Ctrl+C to stop");
   spdlog::info("Socket优化: TCP_NODELAY + 大缓冲区 + KEEPALIVE");
+  spdlog::info("时间单位: 纳秒 (ns)");
   spdlog::info("");
   
   BinanceWebSocket ws;

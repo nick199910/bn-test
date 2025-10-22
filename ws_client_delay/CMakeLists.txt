@@ -32,6 +32,21 @@ if (NOT simdjson_FOUND)
   FetchContent_MakeAvailable(simdjson)
 endif()
 
+# ZeroMQ: message queue for MSK simulation
+find_package(cppzmq CONFIG QUIET)
+if (NOT cppzmq_FOUND)
+  message(STATUS "cppzmq not found in system. Attempting to find libzmq...")
+  find_package(PkgConfig)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(ZMQ libzmq)
+    if(ZMQ_FOUND)
+      message(STATUS "libzmq found via pkg-config")
+    else()
+      message(WARNING "ZeroMQ not found. Install with: sudo apt-get install libzmq3-dev")
+    endif()
+  endif()
+endif()
+
 # websocketpp is header-only: expect it installed in system include path
 add_executable(ws_client_delay ws_client.cpp)
 
@@ -49,6 +64,16 @@ target_link_libraries(ws_client_delay PRIVATE
 )
 target_link_libraries(ws_client_delay PRIVATE spdlog::spdlog)
 target_link_libraries(ws_client_delay PRIVATE simdjson::simdjson)
+
+# Link ZeroMQ if available
+if(cppzmq_FOUND)
+  target_link_libraries(ws_client_delay PRIVATE cppzmq)
+  target_compile_definitions(ws_client_delay PRIVATE HAVE_ZMQ)
+elseif(ZMQ_FOUND)
+  target_include_directories(ws_client_delay PRIVATE ${ZMQ_INCLUDE_DIRS})
+  target_link_libraries(ws_client_delay PRIVATE ${ZMQ_LIBRARIES})
+  target_compile_definitions(ws_client_delay PRIVATE HAVE_ZMQ)
+endif()
 
 target_compile_options(ws_client_delay PRIVATE -Wall -Wextra -O3)
 

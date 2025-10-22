@@ -1,44 +1,3 @@
-# Binance WebSocket Latency Analyzer (C++ + DPDK + eBPF)
-
-## 🧩 Overview
-
-This project demonstrates a **high-performance Binance market data receiver** built in modern **C++11** using:
-- **WebSocket++** for Binance market data streaming  
-- **DPDK** for kernel-bypass packet capture and zero-copy network optimization  
-- **eBPF** for kernel-level latency tracing and statistics  
-- **rigtorp::MPMCQueue** for lock-free multi-producer/multi-consumer event broadcasting between threads  
-
-The demo measures **WebSocket round-trip latency** in both **user space and kernel space**, showing how DPDK + eBPF instrumentation can be used to analyze network performance in real-time.
-
----
-
-## 📦 Project Structure
-
-binance-ws_test/
-├── CMakeLists.txt # Top-level CMake configuration
-├── websocket_client/
-│ ├── websocket_client.cpp # Binance WebSocket client (using websocketpp)
-│ └── CMakeLists.txt
-├── dpdk_capture/
-│ ├── dpdk_capture.cpp # DPDK setup, zero-copy RX/TX, timestamping
-│ └── CMakeLists.txt
-├── ebpf_loader/
-│ ├── ebpf_loader.cpp # eBPF loader & latency probe via libbpf
-│ └── CMakeLists.txt
-├── include/
-│ ├── mpmc_queue.h # rigtorp MPMC queue for inter-thread broadcast
-│ ├── event.h # Event struct (shared_ptr used for MPMC)
-│ └── utils.h # Common utilities and logging
-└── tests/
-├── latency_test.cpp # Unit test for round-trip latency measurement
-└── CMakeLists.txt
-
-
-
----
-
-
-
 ## Archtecture
 A comprehensive latency measurement system for WebSocket connections that correlates timestamps across three layers:
 
@@ -60,7 +19,17 @@ Architecture
 │  WebSocket  │  ← Userspace timestamp
 │   Client    │
 └──────┬──────┘
-       │
+       │ (Receive WebSocket message)
+┌──────▼──────────┐
+│  JSON Parser    │  ← CPU deserialization (simdjson)
+│  (simdjson)     │     ~10-30μs
+└──────┬──────────┘
+       │ (Parse complete)
+┌──────▼──────────┐
+│  ZeroMQ Send    │  ← MSK message publish
+│  (tcp://5555)   │     ~20-50μs
+└──────┬──────────┘
+       │ (Message sent)
 ┌──────▼──────────────┐
 │  Shared Memory      │
 │  Queue (MPMC)       │  ← All events collected here
@@ -70,50 +39,52 @@ Architecture
 │  Correlator     │  ← Matches events, calculates latencies
 └─────────────────┘
 
-## Components
-1. WebSocket Client (websocket_client_fixed.cpp)
+## 组件说明
 
-Connects to Binance WebSocket stream
-Timestamps message arrival in userspace
-Sends periodic pings for RTT measurement
-Publishes events to shared memory queue
-Exports socket FD for eBPF correlation
+### 1. WebSocket 客户端 (ws_client_delay/ws_client.cpp)
 
-2. eBPF Kernel Probe (bpf_program_fixed.c)
+- 连接到 Binance WebSocket 数据流
+- 记录消息到达用户空间的时间戳
+- 使用 simdjson 进行 JSON 反序列化（CPU 延迟 ~10-30μs）
+- 通过 ZeroMQ 发送 MSK 消息（MSK 延迟 ~20-50μs）
+- 发布事件到共享内存队列
+- 导出 socket FD 供 eBPF 关联
 
-Attaches to tcp_recvmsg (kprobe + kretprobe)
-Captures kernel timestamp when data enters TCP receive
-Records actual bytes copied (from return value)
-Correlates via socket pointer
-Publishes to ring buffer
+### 2. eBPF 内核探针 (ebpf_loader/bpf_program.c)
 
-3. eBPF Loader (ebpf_loader_fixed.cpp)
+- 附加到 `tcp_recvmsg` 系统调用（kprobe + kretprobe）
+- 捕获数据进入 TCP 接收缓冲区时的内核时间戳
+- 记录实际复制的字节数（从返回值获取）
+- 通过 socket 指针进行关联
+- 发布到 eBPF ring buffer
 
-Loads and attaches eBPF program
-Reads events from eBPF ring buffer
-Forwards to shared memory queue
-Manages socket FD correlation
+### 3. eBPF 加载器 (ebpf_loader/ebpf_loader.cpp)
 
-4. DPDK Capture (dpdk_capture_fixed.cpp)
+- 加载并附加 eBPF 程序
+- 从 eBPF ring buffer 读取事件
+- 转发到共享内存队列
+- 管理 socket FD 关联
 
-Captures packets at NIC level using DPDK
-High-resolution hardware timestamps
-Parses TCP headers (handles VLAN, IP options)
-Publishes NIC-level events
-Note: Cannot decrypt TLS, timestamps encrypted packets
+### 4. DPDK 数据包捕获 (dpdk_capture/dpdk_capture.cpp)
 
-5. Event Correlator (event_correlator.cpp)
+- 使用 DPDK 在网卡层面捕获数据包
+- 高精度硬件时间戳（NIC 时间戳）
+- 解析 TCP 头部（支持 VLAN、IP 选项）
+- 发布网卡级事件
+- **注意**：无法解密 TLS，只能标记加密数据包的时间戳
 
-Reads events from shared queue
-Correlates events across layers
-Calculates latency breakdowns:
+### 5. 事件关联器 (event_correlator/event_correlator.cpp)
 
-NIC → Kernel
-Kernel → Userspace
-Total NIC → Userspace
-
-
-Prints statistics
+- 从共享队列读取事件
+- 跨层关联事件
+- 计算延迟分解：
+  - **BN → NIC**：Binance 发送到网卡接收
+  - **NIC → Kernel**：网卡到内核
+  - **Kernel → User**：内核到用户空间
+  - **CPU**：JSON 反序列化
+  - **MSK**：ZeroMQ 消息发送
+  - **Total**：端到端总延迟
+- 打印统计信息
 
 
 ## 🔧 Build Requirements
@@ -128,6 +99,7 @@ Prints statistics
 | **WebSocket++** | WebSocket client | `sudo apt install libwebsocketpp-dev` |
 | **DPDK** | Kernel-bypass networking | [Install from source](https://github.com/DPDK/dpdk) |
 | **libbpf** | eBPF loader and tracing | `sudo apt install libbpf-dev` |
+| **ZeroMQ** | Message queue for MSK simulation | `sudo apt install libzmq3-dev` |
 | **Linux Kernel Headers** | For eBPF & DPDK | `sudo apt install linux-headers-$(uname -r)` |
 
 ---
@@ -139,6 +111,7 @@ sudo apt-get install -y \
     libbpf-dev clang llvm \
     libelf-dev libz-dev \
     libssl-dev libboost-all-dev \
+    libzmq3-dev pkg-config \
     dpdk dpdk-dev
 
 # Or build from source for latest versions
@@ -146,22 +119,8 @@ sudo apt-get install -y \
 ```
 
 
-## ⚙️ Build Instructions
 
-### 1. Clone and Initialize
-```bash
-git clone https://github.com/<yourusername>/binance-ws_test.git
-cd binance-ws_test
 
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-```
-
-### 🚀 Running the Demo
-##  Recommended: Automated Script 
-```bash
-sudo ./run_profiler.sh
-```
 
 ## 1. Start the WebSocket Client
 ```bash
@@ -207,38 +166,7 @@ echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 vm.nr_hugepages=512
 ```
 
-## 3. Alternative: Run Without DPDK
-If you don't have a DPDK-compatible NIC, comment out the DPDK section in run_profiler.sh. The system will still profile kernel→userspace latency via eBPF.
 
-## Expected Output
-Correlator Output
-```
-[CORR] seq=1234 tcp_seq=987654321 NIC->Kernel=45us Kernel->User=123us Total=168us
-[CORR] seq=1235 tcp_seq=987654350 NIC->Kernel=42us Kernel->User=115us Total=157us
-
-=== Correlation Statistics ===
-NIC events:       5420
-Kernel events:    5418
-Userspace events: 5416
-Correlated:       5200
-
-=== Average Latencies ===
-NIC->Kernel:   43 us
-Kernel->User:  118 us
-NIC->User:     161 us
-```
-
-This shows:
-
-43 μs: Network card → Kernel TCP stack
-118 μs: Kernel → Userspace application
-161 μs: Total hardware → application latency
-
-WebSocket Ping/Pong RTT
-```
-[ping] rtt_us=2450 us
-```
-This measures round-trip time to Binance servers (~2.5ms typical).
 
 
 

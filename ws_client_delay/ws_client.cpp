@@ -19,6 +19,11 @@
 #include <openssl/ssl.h>
 #include <boost/asio/ssl.hpp>
 #include <simdjson.h>
+#include <sstream>
+
+#ifdef HAVE_ZMQ
+#include <zmq.hpp>
+#endif
 
 typedef websocketpp::config::asio_tls_client tls_client_config;
 typedef websocketpp::client<tls_client_config> client_t;
@@ -30,6 +35,37 @@ static SharedQueue* g_shared_queue = nullptr;
 static std::atomic<uint64_t> g_seq_no{1};
 static int g_websocket_fd = -1;
 static volatile bool g_running = true;
+
+#ifdef HAVE_ZMQ
+// Simple ZeroMQ Producer for MSK message simulation
+class ZMQProducer {
+public:
+  ZMQProducer(const std::string& endpoint) 
+    : context_(1), socket_(context_, zmq::socket_type::pub) {
+    try {
+      socket_.bind(endpoint);
+    } catch (const zmq::error_t& e) {
+      throw std::runtime_error(std::string("ZMQ bind failed: ") + e.what());
+    }
+  }
+  
+  void send_message(const std::string& topic, const std::string& msg) {
+    // Send topic as first frame
+    zmq::message_t topic_msg(topic.data(), topic.size());
+    socket_.send(topic_msg, zmq::send_flags::sndmore);
+    
+    // Send message body as second frame
+    zmq::message_t body_msg(msg.data(), msg.size());
+    socket_.send(body_msg, zmq::send_flags::none);
+  }
+  
+private:
+  zmq::context_t context_;
+  zmq::socket_t socket_;
+};
+
+static std::shared_ptr<ZMQProducer> g_zmq_producer;
+#endif
 
 void signal_handler(int signo) {
   if (signo == SIGINT || signo == SIGTERM) {
@@ -86,6 +122,7 @@ struct CorrelatedEvent {
   uint64_t ts_userspace_ns{0};
   uint64_t ts_cpu_deser_end_ns{0};
   uint64_t src_send_ts_ns{0};
+  uint64_t msk_send_ns{0};
   uint64_t seq_no{0};
   uint32_t tcp_seq{0};
   uint64_t sock_ptr{0};
@@ -102,6 +139,9 @@ struct CorrelatedEvent {
   }
   uint64_t latency_cpu_deser() const {
     return (ts_cpu_deser_end_ns > ts_userspace_ns) ? (ts_cpu_deser_end_ns - ts_userspace_ns) : 0;
+  }
+  uint64_t latency_msk_send() const {
+    return (msk_send_ns > ts_cpu_deser_end_ns) ? (msk_send_ns - ts_cpu_deser_end_ns) : 0;
   }
   uint64_t latency_bn_to_nic() const {
     return (ts_nic_ns > src_send_ts_ns && src_send_ts_ns > 0) ? (ts_nic_ns - src_send_ts_ns) : 0;
@@ -188,30 +228,34 @@ public:
         ce.ts_nic_ns = has_n ? best_n.ts_nic_ns : 0;
         ce.ts_cpu_deser_end_ns = ue.ts_cpu_deserialization;
         ce.src_send_ts_ns = ue.src_send_ts_ns;
+        ce.msk_send_ns = ue.ts_msk_send_ns;
         ce.seq_no = ue.seq_no;
         ce.tcp_seq = ue.tcp_seq ? ue.tcp_seq : (has_n ? best_n.tcp_seq : best_k.tcp_seq);
         ce.sock_ptr = ue.sock_ptr ? ue.sock_ptr : best_k.sock_ptr;
         ce.sock_fd = ue.sock_fd;
 
-        // 输出四段：BN->NIC、NIC->Kernel、Kernel->User、CPU(反序列化)；
-        // Total 定义为 NIC->Kernel + Kernel->User + CPU
+        // 输出五段：BN->NIC、NIC->Kernel、Kernel->User、CPU(反序列化)、MSK_Send
+        // Total = BN->NIC + NIC->Kernel + Kernel->User + CPU + MSK_Send
         auto nk = has_n ? fmt::format("{}ns", ce.latency_nic_to_kernel()) : std::string("N/A");
         auto ku = fmt::format("{}ns", ce.latency_kernel_to_user());
         auto cpu = fmt::format("{}ns", ce.latency_cpu_deser());
+        auto msk = fmt::format("{}ns", ce.latency_msk_send());
         // per-message 偏移 K（epoch - steady），将 NIC 的 steady 对齐到 Epoch 再与 E 相减
         uint64_t K = (ue.ts_userspace_epoch_ns > ue.ts_userspace_ns) ? (ue.ts_userspace_epoch_ns - ue.ts_userspace_ns) : 0;
         uint64_t bn_nic_ns = (has_n && ue.src_send_ts_ns > 0 && K > 0) ? ((ce.ts_nic_ns + K) - ue.src_send_ts_ns) : 0;
         auto bn_nic = has_n && bn_nic_ns > 0 ? fmt::format("{}ns", bn_nic_ns) : std::string("N/A");
-        uint64_t total_with_cpu_ns = ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser();
-        auto total = has_n ? fmt::format("{}ns", total_with_cpu_ns) : std::string("N/A");
+        // Total = BN->NIC + NIC->Kernel + Kernel->User + CPU + MSK_Send
+        uint64_t total_ns = bn_nic_ns + ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser() + ce.latency_msk_send();
+        auto total = has_n ? fmt::format("{}ns", total_ns) : std::string("N/A");
         logger_->info(
-          "[delay] seq={} tcp_seq={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} Total={}",
+          "[delay] seq={} tcp_seq={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} MSK={} Total={}",
           ce.seq_no,
           ce.tcp_seq,
           bn_nic,
           nk,
           ku,
           cpu,
+          msk,
           total);
       }
     }
@@ -255,6 +299,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+#ifdef HAVE_ZMQ
+  // Initialize ZeroMQ producer for MSK message sending
+  try {
+    std::string zmq_endpoint = "tcp://*:5555";
+    if (argc >= 3) zmq_endpoint = argv[2];  // Optional: custom ZMQ endpoint
+    g_zmq_producer = std::make_shared<ZMQProducer>(zmq_endpoint);
+    logger->info("[ZMQ] Producer initialized at {}", zmq_endpoint);
+  } catch (const std::exception& e) {
+    logger->error("[ZMQ] Failed to initialize producer: {}", e.what());
+    return 1;
+  }
+#else
+  logger->warn("[ZMQ] ZeroMQ support not available. Install libzmq3-dev and rebuild.");
+#endif
+
   client_t ws_client;
   ws_client.init_asio();
   ws_client.set_tls_init_handler([&ws_client](websocketpp::connection_hdl h) {
@@ -286,7 +345,7 @@ int main(int argc, char** argv) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 
-    // 解析 BN 发送时间（优先 data.E, 次选 E，再次选 data.T/T），单位通常为毫秒
+    // 解析 BN 发送时间（确定性使用 E 字段 - Event time，与 normal_ws 一致），单位为毫秒
     uint64_t src_send_ts_ns = 0;
     {
       simdjson::dom::parser parser;
@@ -302,21 +361,18 @@ int main(int argc, char** argv) {
           return false;
         };
         uint64_t e_ms = 0;
-        bool found = false;
-        // combined stream
+        // combined stream: data.E
         auto data = doc["data"];
-        if (!found && data.error() == simdjson::SUCCESS) {
+        if (data.error() == simdjson::SUCCESS) {
           simdjson::dom::element de = data.value();
-          if (get_uint(de, "E", e_ms)) { found = true; }
-          else if (get_uint(de, "T", e_ms)) { found = true; }
-        }
-        // single stream
-        if (!found) {
-          if (get_uint(doc, "E", e_ms)) { found = true; }
-          else if (get_uint(doc, "T", e_ms)) { found = true; }
-        }
-        if (found) {
-          src_send_ts_ns = e_ms * 1000000ULL; // ms -> ns
+          if (get_uint(de, "E", e_ms)) {
+            src_send_ts_ns = e_ms * 1000000ULL; // ms -> ns
+          }
+        } else {
+          // single stream: E
+          if (get_uint(doc, "E", e_ms)) {
+            src_send_ts_ns = e_ms * 1000000ULL; // ms -> ns
+          }
         }
       } else {
         logger->warn("[parse] simdjson parse error: {}", simdjson::error_message(doc_res.error()));
@@ -328,6 +384,75 @@ int main(int argc, char** argv) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             steady_clock::now().time_since_epoch()).count());
 
+    // 真实构建和发送 MSK 消息（使用 ZeroMQ）
+    uint64_t ts_msk_send_ns = 0;
+    {
+#ifdef HAVE_ZMQ
+      if (g_zmq_producer) {
+        simdjson::dom::parser parser;
+        simdjson::padded_string pj{msg->get_payload()};
+        auto doc_res = parser.parse(pj);
+        if (doc_res.error() == simdjson::SUCCESS) {
+          simdjson::dom::element doc = doc_res.value();
+          
+          // 构建类似 Kafka 的消息格式
+          std::ostringstream msk_msg;
+          msk_msg << "{\"bornTimestamp\":" << (ts_userspace_epoch_ns / 1000000)
+                  << ",\"data\":{";
+          
+          // 提取事件类型和基本字段
+          std::string_view event_type;
+          std::string_view symbol;
+          
+          // 检查是否是 combined stream
+          auto data = doc["data"];
+          if (data.error() == simdjson::SUCCESS) {
+            simdjson::dom::element de = data.value();
+            if (de["e"].get(event_type) == simdjson::SUCCESS) {
+              msk_msg << "\"event\":\"" << event_type << "\"";
+            }
+            if (de["s"].get(symbol) == simdjson::SUCCESS) {
+              msk_msg << ",\"symbol\":\"" << symbol << "\"";
+            }
+          } else {
+            if (doc["e"].get(event_type) == simdjson::SUCCESS) {
+              msk_msg << "\"event\":\"" << event_type << "\"";
+            }
+            if (doc["s"].get(symbol) == simdjson::SUCCESS) {
+              msk_msg << ",\"symbol\":\"" << symbol << "\"";
+            }
+          }
+          
+          msk_msg << ",\"ts\":" << src_send_ts_ns;
+          msk_msg << ",\"exchange\":\"WSCC-BN\"";
+          msk_msg << "}}";
+          
+          std::string msk_payload = msk_msg.str();
+          std::string topic = std::string(symbol.empty() ? "unknown" : symbol) + ":WSCC-BN";
+          
+          // 真实发送到 ZeroMQ
+          try {
+            g_zmq_producer->send_message(topic, msk_payload);
+          } catch (const std::exception& e) {
+            logger->warn("[ZMQ] Send failed: {}", e.what());
+          }
+        }
+      }
+#else
+      // 如果没有 ZMQ，只做简单的消息构建模拟
+      std::ostringstream msk_msg;
+      msk_msg << "{\"bornTimestamp\":" << (ts_userspace_epoch_ns / 1000000)
+              << ",\"data\":{\"ts\":" << src_send_ts_ns << "}}";
+      std::string msk_payload = msk_msg.str();
+      (void)msk_payload; // 防止未使用警告
+#endif
+      
+      // 记录 MSK 发送完成时间
+      ts_msk_send_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              steady_clock::now().time_since_epoch()).count());
+    }
+
     UnifiedEvent ev{};
     ev.type = EVENT_TYPE_USERSPACE;
     ev.seq_no = g_seq_no.fetch_add(1);
@@ -335,6 +460,7 @@ int main(int argc, char** argv) {
     ev.ts_userspace_epoch_ns = ts_userspace_epoch_ns;
     ev.ts_cpu_deserialization = ts_after_deser_ns; // 绝对时间，相关器内再做差
     ev.src_send_ts_ns = src_send_ts_ns;            // BN 发送时间（绝对）
+    ev.ts_msk_send_ns = ts_msk_send_ns;            // MSK 发送完成时间（绝对）
     ev.ts_kernel_ns = 0;
     ev.ts_nic_ns = 0;
     ev.sock_fd = g_websocket_fd;
