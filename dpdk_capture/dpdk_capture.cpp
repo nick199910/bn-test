@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <signal.h>
+#include <time.h>
 
 static SharedQueue* g_shared_queue = nullptr;
 static volatile bool g_running = true;
@@ -178,9 +179,10 @@ int main(int argc, char** argv) {
     for (uint16_t i = 0; i < nb_rxed; ++i) {
       rte_mbuf* m = bufs[i];
       
-      // FIXED: Get timestamp per packet, not per burst
-      uint64_t tsc = rte_get_tsc_cycles();
-      uint64_t ts_ns = (uint64_t)((double)tsc / tsc_hz * 1e9);
+      // Use CLOCK_MONOTONIC to align with kernel ktime_get_ns()
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
       
       uint8_t* data = rte_pktmbuf_mtod(m, uint8_t*);
       uint16_t pkt_len = rte_pktmbuf_pkt_len(m);

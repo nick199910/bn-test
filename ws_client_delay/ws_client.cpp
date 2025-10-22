@@ -189,7 +189,7 @@ public:
         ce.ts_cpu_deser_end_ns = ue.ts_cpu_deserialization;
         ce.src_send_ts_ns = ue.src_send_ts_ns;
         ce.seq_no = ue.seq_no;
-        ce.tcp_seq = ue.tcp_seq ? ue.tcp_seq : best_k.tcp_seq;
+        ce.tcp_seq = ue.tcp_seq ? ue.tcp_seq : (has_n ? best_n.tcp_seq : best_k.tcp_seq);
         ce.sock_ptr = ue.sock_ptr ? ue.sock_ptr : best_k.sock_ptr;
         ce.sock_fd = ue.sock_fd;
 
@@ -318,9 +318,6 @@ int main(int argc, char** argv) {
         if (found) {
           src_send_ts_ns = e_ms * 1000000ULL; // ms -> ns
         }
-        // 调试日志：打印解析结果与 payload 前缀
-        std::string prefix = msg->get_payload().substr(0, 120);
-        logger->info("[parse] found_ts={} e_ms={} payload_prefix=\"{}\"", found ? 1 : 0, (unsigned long long)e_ms, prefix);
       } else {
         logger->warn("[parse] simdjson parse error: {}", simdjson::error_message(doc_res.error()));
       }
