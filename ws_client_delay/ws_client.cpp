@@ -195,15 +195,15 @@ public:
 
         // 输出四段：BN->NIC、NIC->Kernel、Kernel->User、CPU(反序列化)；
         // Total 定义为 NIC->Kernel + Kernel->User + CPU
-        auto nk = has_n ? fmt::format("{}us", ce.latency_nic_to_kernel() / 1000) : std::string("N/A");
-        auto ku = fmt::format("{}us", ce.latency_kernel_to_user() / 1000);
-        auto cpu = fmt::format("{}us", ce.latency_cpu_deser() / 1000);
+        auto nk = has_n ? fmt::format("{}ns", ce.latency_nic_to_kernel()) : std::string("N/A");
+        auto ku = fmt::format("{}ns", ce.latency_kernel_to_user());
+        auto cpu = fmt::format("{}ns", ce.latency_cpu_deser());
         // per-message 偏移 K（epoch - steady），将 NIC 的 steady 对齐到 Epoch 再与 E 相减
         uint64_t K = (ue.ts_userspace_epoch_ns > ue.ts_userspace_ns) ? (ue.ts_userspace_epoch_ns - ue.ts_userspace_ns) : 0;
         uint64_t bn_nic_ns = (has_n && ue.src_send_ts_ns > 0 && K > 0) ? ((ce.ts_nic_ns + K) - ue.src_send_ts_ns) : 0;
-        auto bn_nic = has_n && bn_nic_ns > 0 ? fmt::format("{}us", bn_nic_ns / 1000) : std::string("N/A");
+        auto bn_nic = has_n && bn_nic_ns > 0 ? fmt::format("{}ns", bn_nic_ns) : std::string("N/A");
         uint64_t total_with_cpu_ns = ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser();
-        auto total = has_n ? fmt::format("{}us", total_with_cpu_ns / 1000) : std::string("N/A");
+        auto total = has_n ? fmt::format("{}ns", total_with_cpu_ns) : std::string("N/A");
         logger_->info(
           "[delay] seq={} tcp_seq={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} Total={}",
           ce.seq_no,
