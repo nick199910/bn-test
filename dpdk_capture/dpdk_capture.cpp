@@ -95,8 +95,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   
-  // Open shared memory queue
-  g_shared_queue = open_shared_queue(SHARED_QUEUE_NAME, 1 << 16);
+  // Open shared memory queue (must match ws_client capacity: 1M events)
+  g_shared_queue = open_shared_queue(SHARED_QUEUE_NAME, 1 << 20);
   if (!g_shared_queue) {
     std::cerr << "Failed to open shared queue. Start websocket client first.\n";
     return 1;

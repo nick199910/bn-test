@@ -5,12 +5,16 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <thread>
 #include <unistd.h>
 
@@ -20,6 +24,11 @@
 #include <boost/asio/ssl.hpp>
 #include <simdjson.h>
 #include <sstream>
+#include <vector>
+
+#ifdef HAVE_CURL
+#include <curl/curl.h>
+#endif
 
 #ifdef HAVE_ZMQ
 #include <zmq.hpp>
@@ -80,6 +89,88 @@ void signal_handler(int signo) {
   }
 }
 
+#ifdef HAVE_CURL
+// CURL 回调函数，用于接收 REST API 响应
+static size_t write_callback_impl(void* contents, size_t size, size_t nmemb, void* userp) {
+  ((std::string*)userp)->append((char*)contents, size * nmemb);
+  return size * nmemb;
+}
+
+// 获取所有 USDT 交易对（可修改过滤条件）
+std::vector<std::string> fetch_all_symbols(const std::string& api_url, std::shared_ptr<spdlog::logger> logger) {
+  std::vector<std::string> symbols;
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    logger->error("[REST] Failed to initialize curl");
+    return symbols;
+  }
+
+  std::string response_buffer;
+  curl_easy_setopt(curl, CURLOPT_URL, api_url.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback_impl);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_buffer);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  curl_easy_cleanup(curl);
+
+  if (res != CURLE_OK) {
+    logger->error("[REST] curl_easy_perform() failed: {}", curl_easy_strerror(res));
+    return symbols;
+  }
+
+  // 使用 simdjson 解析响应
+  try {
+    simdjson::dom::parser parser;
+    simdjson::padded_string pj{response_buffer};
+    auto doc = parser.parse(pj);
+    if (doc.error() != simdjson::SUCCESS) {
+      logger->error("[REST] Failed to parse JSON");
+      return symbols;
+    }
+
+    // 期货市场: doc["symbols"] 数组
+    auto symbols_array = doc["symbols"];
+    if (symbols_array.error() == simdjson::SUCCESS) {
+      for (auto symbol_obj : symbols_array) {
+        std::string_view symbol_name;
+        std::string_view status;
+        if (symbol_obj["symbol"].get(symbol_name) == simdjson::SUCCESS &&
+            symbol_obj["status"].get(status) == simdjson::SUCCESS) {
+          // 只订阅 TRADING 状态且为 USDT 结尾的交易对
+          if (status == "TRADING" && symbol_name.ends_with("USDT")) {
+            std::string s(symbol_name);
+            // 转换为小写
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            symbols.push_back(s);
+          }
+        }
+      }
+    }
+  } catch (const std::exception& e) {
+    logger->error("[REST] Exception while parsing: {}", e.what());
+  }
+
+  logger->info("[REST] Fetched {} trading symbols", symbols.size());
+  return symbols;
+}
+#endif
+
+// 构建订阅消息
+std::string build_subscribe_message(const std::vector<std::string>& symbols, const std::string& stream_type = "aggTrade") {
+  std::ostringstream oss;
+  oss << R"({"method":"SUBSCRIBE","params":[)";
+  
+  for (size_t i = 0; i < symbols.size(); ++i) {
+    if (i > 0) oss << ",";
+    oss << "\"" << symbols[i] << "@" << stream_type << "\"";
+  }
+  
+  oss << R"(],"id":1})";
+  return oss.str();
+}
+
 // TLS 初始化回调（可选开启 SNI）
 std::shared_ptr<boost::asio::ssl::context> on_tls_init(
     websocketpp::connection_hdl h, client_t& ws_client) {
@@ -114,6 +205,92 @@ int get_socket_fd(client_t::connection_ptr con) {
   }
   return -1;
 }
+
+// 异步日志写入器
+class AsyncLogWriter {
+public:
+  explicit AsyncLogWriter(const std::string& filename) 
+    : running_(true), filename_(filename) {
+    log_file_.open(filename, std::ios::out | std::ios::app);
+    if (!log_file_.is_open()) {
+      throw std::runtime_error("Failed to open log file: " + filename);
+    }
+    
+    // 启动写入线程
+    writer_thread_ = std::thread([this]() {
+      while (running_) {
+        std::string line;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          if (queue_.empty()) {
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+          }
+          line = std::move(queue_.front());
+          queue_.pop();
+        }
+        
+        // 写入文件（在锁外执行 I/O）
+        log_file_ << line;
+        
+        // 每 500 条刷新一次，平衡性能和数据安全
+        if (++write_count_ % 500 == 0) {
+          log_file_.flush();
+        }
+      }
+      
+      // 退出前写入所有剩余数据
+      std::unique_lock<std::mutex> lock(mutex_);
+      while (!queue_.empty()) {
+        log_file_ << queue_.front();
+        queue_.pop();
+      }
+      log_file_.flush();
+    });
+  }
+  
+  ~AsyncLogWriter() {
+    running_ = false;
+    if (writer_thread_.joinable()) {
+      writer_thread_.join();
+    }
+    if (log_file_.is_open()) {
+      log_file_.close();
+    }
+  }
+  
+  // 非阻塞写入
+  void write(const std::string& line) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    queue_.push(line);
+    
+    // 队列过大时发出警告（但不阻塞）
+    if (queue_.size() > 10000) {
+      static uint64_t last_warn = 0;
+      uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (now - last_warn > 60) {  // 每分钟最多警告一次
+        std::cerr << "[AsyncLogWriter] Warning: queue size = " << queue_.size() << std::endl;
+        last_warn = now;
+      }
+    }
+  }
+  
+  size_t queue_size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queue_.size();
+  }
+
+private:
+  std::atomic<bool> running_;
+  std::ofstream log_file_;
+  std::string filename_;
+  std::queue<std::string> queue_;
+  mutable std::mutex mutex_;
+  std::thread writer_thread_;
+  uint64_t write_count_{0};
+};
 
 // 进程内简化关联器（基于 `event_correlator` 适配），将 NIC/内核/用户态事件进行关联
 struct CorrelatedEvent {
@@ -153,7 +330,8 @@ struct CorrelatedEvent {
 
 class EventCorrelator {
 public:
-  explicit EventCorrelator(std::shared_ptr<spdlog::logger> logger) : logger_(std::move(logger)) {}
+  explicit EventCorrelator(std::shared_ptr<spdlog::logger> logger, AsyncLogWriter* async_writer = nullptr) 
+    : logger_(std::move(logger)), async_writer_(async_writer) {}
 
   void add_event(const UnifiedEvent& ev) {
     // 保持小窗口；优先基于 tcp_seq / sock_ptr / 时间临近 进行匹配
@@ -257,6 +435,20 @@ public:
           cpu,
           msk,
           total);
+        
+        // 异步写入日志文件（仅写入完整的记录，跳过包含 N/A 的）
+        if (async_writer_ && has_n && bn_nic_ns > 0) {
+          std::ostringstream log_line;
+          log_line << "seq=" << ce.seq_no
+                   << " tcp_seq=" << ce.tcp_seq
+                   << " BN->NIC=" << bn_nic_ns << "ns"
+                   << " NIC->Kernel=" << ce.latency_nic_to_kernel() << "ns"
+                   << " Kernel->User=" << ce.latency_kernel_to_user() << "ns"
+                   << " CPU=" << ce.latency_cpu_deser() << "ns"
+                   << " MSK=" << ce.latency_msk_send() << "ns"
+                   << " Total=" << total_ns << "ns\n";
+          async_writer_->write(log_line.str());  // 非阻塞写入
+        }
       }
     }
 
@@ -277,6 +469,7 @@ private:
   std::vector<UnifiedEvent> kernel_events_;
   std::vector<UnifiedEvent> user_events_;
   std::shared_ptr<spdlog::logger> logger_;
+  AsyncLogWriter* async_writer_;
 };
 
 int main(int argc, char** argv) {
@@ -289,11 +482,66 @@ int main(int argc, char** argv) {
     logger = spdlog::stdout_color_mt("ws_delay");
   }
 
+  // 解析命令行参数
+  bool enable_log_file = false;
   std::string uri = "wss://fstream.binance.com:443/ws/stream";
-  if (argc >= 2) uri = argv[1];
+  
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "-wlogs") {
+      enable_log_file = true;
+    } else if (arg.find("wss://") == 0 || arg.find("ws://") == 0) {
+      uri = arg;
+    }
+  }
+  
+  // 创建异步日志写入器（如果启用）
+  std::unique_ptr<AsyncLogWriter> async_writer;
+  if (enable_log_file) {
+    std::string log_filename = "latency_" + std::to_string(std::time(nullptr)) + ".log";
+    try {
+      async_writer.reset(new AsyncLogWriter(log_filename));
+      logger->info("[wlogs] Async latency log writer enabled: {}", log_filename);
+    } catch (const std::exception& e) {
+      logger->error("[wlogs] Failed to create async writer: {}", e.what());
+      enable_log_file = false;
+    }
+  }
+
+  // 获取所有交易对（Binance 期货市场）
+  std::vector<std::string> symbols;
+#ifdef HAVE_CURL
+  std::string api_url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+  logger->info("[REST] Fetching all trading symbols from {}", api_url);
+  symbols = fetch_all_symbols(api_url, logger);
+  
+  if (symbols.empty()) {
+    logger->warn("[REST] No symbols fetched, falling back to default subscription");
+    symbols.push_back("btcusdt");
+  }
+#else
+  logger->warn("[CURL] Not available. Using default subscription. Install libcurl4-openssl-dev to enable dynamic symbol fetching.");
+  symbols.push_back("btcusdt");
+  symbols.push_back("ethusdt");
+  symbols.push_back("bnbusdt");
+#endif
+  
+  // 限制最多订阅交易对数量
+  // Binance 单连接限制：通过二分法测试得出最大值为 205 个流
+  const size_t MAX_SUBSCRIPTIONS = 205;
+  if (symbols.size() > MAX_SUBSCRIPTIONS) {
+    logger->warn("[WS] Symbol count {} exceeds limit {}, truncating to first {} symbols", 
+                 symbols.size(), MAX_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS);
+    symbols.resize(MAX_SUBSCRIPTIONS);
+  }
+  
+  // 构建订阅消息
+  std::string subscribe_msg = build_subscribe_message(symbols, "aggTrade");
+  logger->info("[WS] Subscribe message length: {} bytes, symbols count: {}", subscribe_msg.size(), symbols.size());
 
   // Initialize shared memory queue (creator)
-  g_shared_queue = create_shared_queue(SHARED_QUEUE_NAME, 1 << 16);
+  // 使用 1M 容量以支持长时间运行（约 640 MB 内存，可缓冲 ~15 分钟高峰流量）
+  g_shared_queue = create_shared_queue(SHARED_QUEUE_NAME, 1 << 20);  // 1M events
   if (!g_shared_queue) {
     logger->error("Failed to create shared queue");
     return 1;
@@ -323,7 +571,7 @@ int main(int argc, char** argv) {
   ws_client.clear_error_channels(websocketpp::log::elevel::all);
 
   // 连接建立回调：记录 socket fd 并发送订阅
-  ws_client.set_open_handler([&ws_client, logger](websocketpp::connection_hdl h) {
+  ws_client.set_open_handler([&ws_client, logger, subscribe_msg](websocketpp::connection_hdl h) {
     logger->info("[ws] connected");
     auto con = ws_client.get_con_from_hdl(h);
     g_websocket_fd = get_socket_fd(con);
@@ -331,8 +579,9 @@ int main(int argc, char** argv) {
       logger->info("[ws] socket_fd={}", g_websocket_fd);
       write_socket_fd_to_ebpf(g_websocket_fd);
     }
-    std::string sub = R"({"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1})";
-    con->send(sub);
+    // 发送订阅消息（订阅所有交易对）
+    logger->info("[ws] Sending subscription for all symbols...");
+    con->send(subscribe_msg);
   });
 
   // 消息回调：写入用户态事件到共享队列（解析 BN 服务器时间与反序列化耗时）
@@ -507,8 +756,8 @@ int main(int argc, char** argv) {
   });
 
   // 关联线程：从共享队列读取事件并输出各段时延
-  std::thread corr_thread([logger]() {
-    EventCorrelator corr(logger);
+  std::thread corr_thread([logger, &async_writer]() {
+    EventCorrelator corr(logger, async_writer.get());
     UnifiedEvent ev{};
     while (g_running) {
       if (shared_queue_pop(g_shared_queue, &ev)) {
@@ -533,6 +782,13 @@ int main(int argc, char** argv) {
   g_running = false;
   if (corr_thread.joinable()) corr_thread.join();
   if (shutdown_thread.joinable()) shutdown_thread.join();
+
+  // 关闭异步日志写入器（析构函数会自动完成剩余写入）
+  if (async_writer) {
+    logger->info("[wlogs] Closing async log writer, queue size: {}", async_writer->queue_size());
+    async_writer.reset();  // 触发析构，等待所有数据写入完成
+    logger->info("[wlogs] Async log writer closed");
+  }
 
   cleanup_shared_queue(g_shared_queue);
   return 0;

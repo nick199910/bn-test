@@ -5,6 +5,9 @@ find_package(Boost REQUIRED COMPONENTS system thread)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
+# CURL is optional for dynamic symbol fetching
+find_package(CURL QUIET)
+
 # 使用 spdlog 作为日志库：优先本地已安装，其次自动拉取
 include(FetchContent)
 set(SPDLOG_FALLBACK OFF)
@@ -64,6 +67,16 @@ target_link_libraries(ws_client_delay PRIVATE
 )
 target_link_libraries(ws_client_delay PRIVATE spdlog::spdlog)
 target_link_libraries(ws_client_delay PRIVATE simdjson::simdjson)
+
+# Link CURL if available
+if(CURL_FOUND)
+  target_link_libraries(ws_client_delay PRIVATE CURL::libcurl)
+  target_compile_definitions(ws_client_delay PRIVATE HAVE_CURL)
+  message(STATUS "CURL found. Dynamic symbol fetching enabled.")
+else()
+  message(WARNING "CURL not found. Install with: sudo apt-get install libcurl4-openssl-dev")
+  message(WARNING "Falling back to default symbol subscription.")
+endif()
 
 # Link ZeroMQ if available
 if(cppzmq_FOUND)

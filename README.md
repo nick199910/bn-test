@@ -197,6 +197,7 @@ sudo apt-get install -y \
     libelf-dev libz-dev \
     libssl-dev libboost-all-dev \
     libzmq3-dev pkg-config \
+    libcurl4-openssl-dev \
     dpdk dpdk-dev
 
 # 或者从源码编译最新版本
@@ -204,10 +205,26 @@ sudo apt-get install -y \
 ```
 
 ## 1. 启动 WebSocket 客户端
+
+### 基本运行（仅控制台输出）
 ```bash
-./websocket_client wss://fstream.binance.com:443/ws/stream
+./build/ws_client_delay/ws_client_delay
 ```
-连接到 Binance Futures WebSocket 数据流并开始接收市场数据。
+
+### 启用延迟日志文件（用于 P99 分析）
+```bash
+./build/ws_client_delay/ws_client_delay -wlogs
+```
+
+使用 `-wlogs` 参数时，程序会将完整的延迟数据写入日志文件（格式：`latency_<timestamp>.log`），用于后续 P99/P95 等统计分析。日志格式：
+```
+seq=6524 tcp_seq=4108161045 BN->NIC=147739100ns NIC->Kernel=863241ns Kernel->User=77219ns CPU=6562ns MSK=16422ns Total=148702544ns
+```
+
+**注意**：
+- 仅写入完整的延迟记录（包含所有层级时间戳）
+- 跳过包含 `N/A` 的不完整记录
+- 适合用阿里云日志服务、ELK 等工具进行分析
 
 ## 2. 启动 eBPF 延迟探针
 ```bash
@@ -353,10 +370,71 @@ DPDK 架构（绕过内核）:
 2. **使用 AWS Direct Connect** → 节省 ~10-20ms (7-15%)
 3. **使用 DPDK 绕过内核** → 节省 ~4.4ms (3.2%)
 
-**结论**：除非已经在新加坡机房且使用专线，否则 DPDK 的 3.2% 优化不如优化网络路径。  
+**结论**：除非已经在新加坡机房且使用专线，否则 DPDK 的 3.2% 优化不如优化网络路径。
 
+---
 
+## 延迟日志分析
 
+### 生成延迟日志文件
+
+使用 `-wlogs` 参数运行 WebSocket 客户端：
+
+```bash
+./build/ws_client_delay/ws_client_delay -wlogs
+```
+
+程序会生成格式如 `latency_1730043123.log` 的日志文件。
+
+### 分析 P99 延迟
+
+使用提供的 Python 分析脚本：
+
+```bash
+python3 analyze_latency.py latency_1730043123.log
+```
+
+**输出示例**：
+
+```
+分析延迟日志文件: latency_1730043123.log
+============================================================
+
+BN → NIC（交易所到网卡）:
+  样本数量: 12580
+  平均值: 144.523 ms
+  中位数: 143.892 ms
+  最小值: 135.234 ms
+  最大值: 148.765 ms
+  P50: 143.892 ms
+  P95: 147.234 ms
+  P99: 147.891 ms
+  P999: 148.456 ms
+
+总延迟（端到端）:
+  样本数量: 12580
+  平均值: 148.623 ms
+  中位数: 148.102 ms
+  最小值: 139.456 ms
+  最大值: 152.891 ms
+  P50: 148.102 ms
+  P95: 151.234 ms
+  P99: 151.891 ms
+  P999: 152.456 ms
+```
+
+### 使用阿里云日志服务分析
+
+日志格式可直接导入阿里云 SLS 或 ELK：
+
+1. 上传日志文件到阿里云 SLS
+2. 配置日志解析规则（正则表达式）
+3. 创建统计图表查看 P99 趋势
+
+**正则表达式示例**：
+```
+seq=(?<seq>\d+) tcp_seq=(?<tcp_seq>\d+) BN->NIC=(?<bn_nic>\d+)ns NIC->Kernel=(?<nic_kernel>\d+)ns Kernel->User=(?<kernel_user>\d+)ns CPU=(?<cpu>\d+)ns MSK=(?<msk>\d+)ns Total=(?<total>\d+)ns
+```
 
 
 
