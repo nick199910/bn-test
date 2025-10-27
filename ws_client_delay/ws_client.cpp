@@ -304,6 +304,7 @@ struct CorrelatedEvent {
   uint32_t tcp_seq{0};
   uint64_t sock_ptr{0};
   int32_t sock_fd{-1};
+  std::string symbol;  // Trading pair symbol
 
   uint64_t latency_nic_to_kernel() const {
     return (ts_kernel_ns > ts_nic_ns) ? (ts_kernel_ns - ts_nic_ns) : 0;
@@ -411,6 +412,32 @@ public:
         ce.tcp_seq = ue.tcp_seq ? ue.tcp_seq : (has_n ? best_n.tcp_seq : best_k.tcp_seq);
         ce.sock_ptr = ue.sock_ptr ? ue.sock_ptr : best_k.sock_ptr;
         ce.sock_fd = ue.sock_fd;
+        
+        // Extract symbol from JSON payload
+        ce.symbol = "UNKNOWN";
+        try {
+          simdjson::dom::parser parser;
+          simdjson::padded_string pj{ue.data, ue.data_len};
+          auto doc_res = parser.parse(pj);
+          if (doc_res.error() == simdjson::SUCCESS) {
+            simdjson::dom::element doc = doc_res.value();
+            std::string_view symbol_view;
+            // Try combined stream: data.s
+            auto data = doc["data"];
+            if (data.error() == simdjson::SUCCESS) {
+              if (data.value()["s"].get(symbol_view) == simdjson::SUCCESS) {
+                ce.symbol = std::string(symbol_view);
+              }
+            } else {
+              // Try direct format: s
+              if (doc["s"].get(symbol_view) == simdjson::SUCCESS) {
+                ce.symbol = std::string(symbol_view);
+              }
+            }
+          }
+        } catch (...) {
+          // Keep default "UNKNOWN" on parse error
+        }
 
         // 输出五段：BN->NIC、NIC->Kernel、Kernel->User、CPU(反序列化)、MSK_Send
         // Total = BN->NIC + NIC->Kernel + Kernel->User + CPU + MSK_Send
@@ -426,9 +453,10 @@ public:
         uint64_t total_ns = bn_nic_ns + ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser() + ce.latency_msk_send();
         auto total = has_n ? fmt::format("{}ns", total_ns) : std::string("N/A");
         logger_->info(
-          "[delay] seq={} tcp_seq={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} MSK={} Total={}",
+          "[delay] seq={} tcp_seq={} symbol={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} MSK={} Total={}",
           ce.seq_no,
           ce.tcp_seq,
+          ce.symbol,
           bn_nic,
           nk,
           ku,
@@ -441,6 +469,7 @@ public:
           std::ostringstream log_line;
           log_line << "seq=" << ce.seq_no
                    << " tcp_seq=" << ce.tcp_seq
+                   << " symbol=" << ce.symbol
                    << " BN->NIC=" << bn_nic_ns << "ns"
                    << " NIC->Kernel=" << ce.latency_nic_to_kernel() << "ns"
                    << " Kernel->User=" << ce.latency_kernel_to_user() << "ns"
