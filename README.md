@@ -264,7 +264,7 @@ vm.nr_hugepages=512
 ### 延迟指标定义
 
 ```
-[delay] seq=221 tcp_seq=126 
+[delay] seq=221 tcp_seq=126 symbol=bnbusdt
 BN->NIC=?ns      // Binance 发送到网卡接收 (物理网络延迟)
 NIC->Kernel=?ns    // 网卡到内核 TCP 栈 (中断 + 协议栈处理)
 Kernel->User=?ns    // 内核到用户空间 (系统调用 + 上下文切换)

@@ -45,6 +45,9 @@ static std::atomic<uint64_t> g_seq_no{1};
 static int g_websocket_fd = -1;
 static volatile bool g_running = true;
 
+// 全局时钟偏移（启动时初始化一次，避免 per-message 计算）
+static uint64_t g_clock_offset_ns = 0;
+
 #ifdef HAVE_ZMQ
 // Simple ZeroMQ Producer for MSK message simulation
 class ZMQProducer {
@@ -445,13 +448,20 @@ public:
         auto ku = fmt::format("{}ns", ce.latency_kernel_to_user());
         auto cpu = fmt::format("{}ns", ce.latency_cpu_deser());
         auto msk = fmt::format("{}ns", ce.latency_msk_send());
-        // per-message 偏移 K（epoch - steady），将 NIC 的 steady 对齐到 Epoch 再与 E 相减
-        uint64_t K = (ue.ts_userspace_epoch_ns > ue.ts_userspace_ns) ? (ue.ts_userspace_epoch_ns - ue.ts_userspace_ns) : 0;
-        uint64_t bn_nic_ns = (has_n && ue.src_send_ts_ns > 0 && K > 0) ? ((ce.ts_nic_ns + K) - ue.src_send_ts_ns) : 0;
+        
+        // BN->NIC: 使用全局时钟偏移（启动时计算一次）- 用于细分显示
+        // 将 NIC 的 steady_clock 时间戳对齐到 epoch，然后减去 BN 发送时间
+        uint64_t bn_nic_ns = (has_n && ue.src_send_ts_ns > 0 && g_clock_offset_ns > 0) 
+                           ? ((ce.ts_nic_ns + g_clock_offset_ns) - ue.src_send_ts_ns) : 0;
         auto bn_nic = has_n && bn_nic_ns > 0 ? fmt::format("{}ns", bn_nic_ns) : std::string("N/A");
-        // Total = BN->NIC + NIC->Kernel + Kernel->User + CPU + MSK_Send
-        uint64_t total_ns = bn_nic_ns + ce.latency_nic_to_kernel() + ce.latency_kernel_to_user() + ce.latency_cpu_deser() + ce.latency_msk_send();
-        auto total = has_n ? fmt::format("{}ns", total_ns) : std::string("N/A");
+        
+        // BN->User: 直接用 userspace epoch 时间（用于 Total 计算，更准确）
+        uint64_t bn_to_user_ns = (ue.ts_userspace_epoch_ns > ue.src_send_ts_ns && ue.src_send_ts_ns > 0) 
+                                ? (ue.ts_userspace_epoch_ns - ue.src_send_ts_ns) : 0;
+        
+        // Total = BN->User + CPU + MSK (使用 epoch 时间，避免时钟偏移误差)
+        uint64_t total_ns = bn_to_user_ns + ce.latency_cpu_deser() + ce.latency_msk_send();
+        auto total = bn_to_user_ns > 0 ? fmt::format("{}ns", total_ns) : std::string("N/A");
         logger_->info(
           "[delay] seq={} tcp_seq={} symbol={} BN->NIC={} NIC->Kernel={} Kernel->User={} CPU={} MSK={} Total={}",
           ce.seq_no,
@@ -465,13 +475,13 @@ public:
           total);
         
         // 异步写入日志文件（仅写入完整的记录，跳过包含 N/A 的）
-        if (async_writer_ && has_n && bn_nic_ns > 0) {
+        if (async_writer_ && bn_to_user_ns > 0) {
           std::ostringstream log_line;
           log_line << "seq=" << ce.seq_no
                    << " tcp_seq=" << ce.tcp_seq
                    << " symbol=" << ce.symbol
-                   << " BN->NIC=" << bn_nic_ns << "ns"
-                   << " NIC->Kernel=" << ce.latency_nic_to_kernel() << "ns"
+                   << " BN->NIC=" << (has_n ? bn_nic_ns : 0) << "ns"
+                   << " NIC->Kernel=" << (has_n ? ce.latency_nic_to_kernel() : 0) << "ns"
                    << " Kernel->User=" << ce.latency_kernel_to_user() << "ns"
                    << " CPU=" << ce.latency_cpu_deser() << "ns"
                    << " MSK=" << ce.latency_msk_send() << "ns"
@@ -505,11 +515,22 @@ int main(int argc, char** argv) {
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
 
+  // 初始化全局时钟偏移（启动时计算一次）
+  // steady_clock 用于测量时间间隔，system_clock 用于 epoch 时间
+  auto steady_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          steady_clock::now().time_since_epoch()).count());
+  auto epoch_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  g_clock_offset_ns = epoch_ns - steady_ns;
+
   spdlog::set_level(spdlog::level::info);
   auto logger = spdlog::get("ws_delay");
   if (!logger) {
     logger = spdlog::stdout_color_mt("ws_delay");
   }
+  logger->info("[init] Global clock offset initialized: {} ns", g_clock_offset_ns);
 
   // 解析命令行参数
   bool enable_log_file = false;
