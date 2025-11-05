@@ -233,31 +233,93 @@ seq=6524 tcp_seq=4108161045 BN->NIC=147739100ns NIC->Kernel=863241ns Kernel->Use
 附加内核探针到 socket 协议栈，测量从数据包到达到用户空间消息处理的延迟。
 
 ## 3. 运行 DPDK 数据包捕获
+
+### 方式 1: net_pcap 模式（推荐用于测试/开发）
+
+使用 net_pcap 从现有网卡捕获数据包，无需绑定网卡到 DPDK，不会断网：
+
 ```bash
-./dpdk_capture -l 0-1 -n 4 --
+# 确保网卡启用
+sudo ip link set eth0 up
+
+# 加载 vhost-net 模块（用于 virtio-user）
+sudo modprobe vhost-net
+sudo chmod 666 /dev/vhost-net  # 如果需要非 root 运行
+
+# 运行 DPDK 捕获程序
+sudo ./build/dpdk_capture/dpdk_capture -l 0-1 -n 2 --vdev=net_pcap0,iface=eth0 --
 ```
 
-## DPDK 设置
-DPDK 需要特殊配置：
-### 1. 绑定网卡到 DPDK 驱动
+**说明**：
+- `--vdev=net_pcap0,iface=eth0`：从 eth0 网卡捕获数据包
+- 程序会自动创建 `veth_dpdk` 虚拟接口用于内核通信
+- TCP 数据包在 DPDK 中处理，非 TCP 包转发到内核
+- 不影响现有网络连接，适合 SSH 远程操作
+
+启动后配置虚拟接口（可选）：
+```bash
+sudo ip link set veth_dpdk up
+sudo ip addr add 192.168.100.1/24 dev veth_dpdk  # 如果需要
+```
+
+### 方式 2: 原生 DPDK 模式（生产环境）
+
+直接绑定网卡到 DPDK 驱动，获得最佳性能：
 
 ```bash
-# 显示可用网卡
+# 1. 显示可用网卡
 dpdk-devbind.py --status
 
-# 绑定网卡到 vfio-pci 或 uio_pci_generic
+# 2. 启用 vfio noiommu 模式（虚拟机环境需要）
+echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+
+# 3. 加载驱动
 sudo modprobe vfio-pci
-sudo dpdk-devbind.py --bind=vfio-pci 0000:01:00.0 // 注: 这里要根据真实的网卡做实时的网卡号替换， ox环境的aws为 0000:01:00.0 ， 但是aws为虚拟网卡，其可能产生
-较大的延迟  
+
+# 4. 解绑网卡
+sudo dpdk-devbind.py --unbind 0000:01:00.0
+
+# 5. 绑定到 DPDK
+sudo dpdk-devbind.py --bind=vfio-pci 0000:01:00.0
+
+# 6. 验证
+dpdk-devbind.py --status
 ```
-### 2. 配置大页内存 
+
+⚠️ **警告**：绑定后网卡会从内核消失，SSH 连接会断开！仅在以下情况使用：
+- 有多个网卡，其他网卡用于管理
+- 通过控制台访问，不依赖网络
+- 测试完后会重启恢复
+
+运行命令：
+```bash
+sudo ./build/dpdk_capture/dpdk_capture -l 0-1 -n 2 --
+```
+
+### 配置大页内存
+
 ```bash
 # 分配 1GB 大页内存
-echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+echo 512 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 
 # 或者添加到 /etc/sysctl.conf：
 vm.nr_hugepages=512
+
+# 验证
+grep HugePages /proc/meminfo
 ```
+
+### virtio-user vs KNI
+
+本项目已从已废弃的 KNI 迁移到 virtio-user：
+
+| 特性 | KNI (已废弃) | virtio-user (当前) |
+|------|-------------|-------------------|
+| 内核模块 | 需要编译 rte_kni.ko | 使用上游 vhost-net |
+| 维护状态 | DPDK 23.11 已移除 | 官方推荐方案 |
+| 功能支持 | 基础功能 | 多队列、TSO、offload |
+| 接口名称 | vEth0 | veth_dpdk |
+| 稳定性 | 退出时可能崩溃 | 优雅清理 |
 
 ## 延迟测量说明
 

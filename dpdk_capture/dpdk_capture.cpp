@@ -213,10 +213,21 @@ int lcore_loop(__attribute__((unused)) void* dummy) {
 		/* Burst tx to virtio-user (kernel) */
 		if (nb_kernel && virtio_port_id != RTE_MAX_ETHPORTS) {
 			num = rte_eth_tx_burst(virtio_port_id, 0, kernel_bufs, nb_kernel);
+			if (num > 0) {
+				static uint64_t last_log = 0;
+				uint64_t now = rte_get_tsc_cycles();
+				if ((now - last_log) > tsc_hz) {  // Log once per second
+					std::cout << "[dpdk] Forwarded " << num << " non-TCP packets to veth_dpdk" << std::endl;
+					last_log = now;
+				}
+			}
 			if (unlikely(num < nb_kernel)) {
 				/* Free mbufs not sent to kernel */
 				burst_free_mbufs(&kernel_bufs[num], nb_kernel - num);
 			}
+		} else if (nb_kernel > 0) {
+			// virtio-user not available, free the packets
+			burst_free_mbufs(kernel_bufs, nb_kernel);
 		}
         }
 
@@ -224,6 +235,13 @@ int lcore_loop(__attribute__((unused)) void* dummy) {
 	if (virtio_port_id != RTE_MAX_ETHPORTS) {
 		nb_kernel = rte_eth_rx_burst(virtio_port_id, 0, kernel_bufs, MAX_PKT_BURST);
 		if (nb_kernel > 0) {
+			static uint64_t last_log_rx = 0;
+			uint64_t now = rte_get_tsc_cycles();
+			if ((now - last_log_rx) > tsc_hz) {  // Log once per second
+				std::cout << "[dpdk] Received " << nb_kernel << " packets from veth_dpdk (kernel)" << std::endl;
+				last_log_rx = now;
+			}
+			
 			// Forward back to physical port 0
 			num = rte_eth_tx_burst(0, 0, kernel_bufs, nb_kernel);
 			if (unlikely(num < nb_kernel)) {
