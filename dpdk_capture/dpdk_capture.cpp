@@ -301,21 +301,50 @@ static inline int port_init(uint16_t port, struct rte_mempool* mbuf_pool) {
     return 0;
 }
 
+/* Cleanup function for graceful shutdown */
+static void cleanup_resources(void) {
+	uint16_t port_id;
+	
+	std::cout << "[dpdk] Cleaning up resources..." << std::endl;
+	
+	// Stop all ports
+	RTE_ETH_FOREACH_DEV(port_id) {
+		std::cout << "[dpdk] Stopping port " << port_id << std::endl;
+		rte_eth_dev_stop(port_id);
+		rte_eth_dev_close(port_id);
+	}
+	
+	// Remove virtio-user device if created
+	if (virtio_port_id != RTE_MAX_ETHPORTS) {
+		char portname[32];
+		snprintf(portname, sizeof(portname), "virtio_user0");
+		std::cout << "[dpdk] Removing virtio-user device" << std::endl;
+		rte_eal_hotplug_remove("vdev", portname);
+	}
+	
+	std::cout << "[dpdk] Cleanup complete" << std::endl;
+}
+
 /* Create virtio-user port for kernel communication */
 static int create_virtio_user_port(uint16_t physical_port) {
 	struct rte_ether_addr mac_addr;
 	char portname[32];
 	char portargs[512];
 	uint16_t port_id;
+	int ret;
 
 	// Get MAC address of physical port
-	rte_eth_macaddr_get(physical_port, &mac_addr);
+	ret = rte_eth_macaddr_get(physical_port, &mac_addr);
+	if (ret != 0) {
+		std::cerr << "[dpdk] Failed to get MAC address for port " << physical_port << std::endl;
+		return -1;
+	}
 
 	// Set the name and arguments for virtio-user device
-	snprintf(portname, sizeof(portname), "virtio_user%u", physical_port);
+	snprintf(portname, sizeof(portname), "virtio_user0");
 	snprintf(portargs, sizeof(portargs),
-		"path=/dev/vhost-net,queues=1,queue_size=%u,iface=%s,mac=%02x:%02x:%02x:%02x:%02x:%02x",
-		RX_RING_SIZE, portname,
+		"path=/dev/vhost-net,queues=1,queue_size=%u,iface=veth_dpdk,mac=%02x:%02x:%02x:%02x:%02x:%02x",
+		RX_RING_SIZE,
 		mac_addr.addr_bytes[0], mac_addr.addr_bytes[1],
 		mac_addr.addr_bytes[2], mac_addr.addr_bytes[3],
 		mac_addr.addr_bytes[4], mac_addr.addr_bytes[5]);
@@ -324,57 +353,62 @@ static int create_virtio_user_port(uint16_t physical_port) {
 	std::cout << "[dpdk] Args: " << portargs << std::endl;
 
 	// Add the vdev for virtio_user
-	if (rte_eal_hotplug_add("vdev", portname, portargs) < 0) {
-		std::cerr << "[dpdk] Failed to create virtio-user port for port "
-			<< physical_port << std::endl;
+	ret = rte_eal_hotplug_add("vdev", portname, portargs);
+	if (ret < 0) {
+		std::cerr << "[dpdk] rte_eal_hotplug_add failed with error: " << ret << std::endl;
+		std::cerr << "[dpdk] Make sure /dev/vhost-net exists and is accessible" << std::endl;
+		std::cerr << "[dpdk] Try: sudo modprobe vhost-net" << std::endl;
 		return -1;
 	}
 
-	// Find the newly created virtio-user port ID
-	RTE_ETH_FOREACH_DEV(port_id) {
-		struct rte_eth_dev_info dev_info;
-		rte_eth_dev_info_get(port_id, &dev_info);
-		
-		// Check if this is our virtio-user device
-		if (strstr(dev_info.driver_name, "virtio") != NULL) {
+	// Give it a moment to initialize
+	usleep(100000); // 100ms
+
+	// Get the port ID by name
+	ret = rte_eth_dev_get_port_by_name(portname, &port_id);
+	if (ret != 0) {
+		std::cerr << "[dpdk] Failed to get port ID for " << portname << std::endl;
+		std::cerr << "[dpdk] Available ports:" << std::endl;
+		RTE_ETH_FOREACH_DEV(port_id) {
 			char dev_name[RTE_ETH_NAME_MAX_LEN];
+			struct rte_eth_dev_info dev_info;
 			rte_eth_dev_get_name_by_port(port_id, dev_name);
-			if (strcmp(dev_name, portname) == 0) {
-				virtio_port_id = port_id;
-				std::cout << "[dpdk] virtio-user port created with ID: " 
-					<< port_id << std::endl;
-				
-				// Initialize the virtio-user port
-				struct rte_eth_conf virt_conf = {};
-				if (rte_eth_dev_configure(port_id, 1, 1, &virt_conf) < 0) {
-					std::cerr << "[dpdk] Failed to configure virtio-user port" << std::endl;
-					return -1;
-				}
-				
-				if (rte_eth_rx_queue_setup(port_id, 0, RX_RING_SIZE,
-						rte_eth_dev_socket_id(port_id), NULL, mbuf_pool) < 0) {
-					std::cerr << "[dpdk] Failed to setup RX queue for virtio-user" << std::endl;
-					return -1;
-				}
-				
-				if (rte_eth_tx_queue_setup(port_id, 0, TX_RING_SIZE,
-						rte_eth_dev_socket_id(port_id), NULL) < 0) {
-					std::cerr << "[dpdk] Failed to setup TX queue for virtio-user" << std::endl;
-					return -1;
-				}
-				
-				if (rte_eth_dev_start(port_id) < 0) {
-					std::cerr << "[dpdk] Failed to start virtio-user port" << std::endl;
-					return -1;
-				}
-				
-				return 0;
-			}
+			rte_eth_dev_info_get(port_id, &dev_info);
+			std::cerr << "[dpdk]   Port " << port_id << ": " << dev_name 
+				<< " (" << dev_info.driver_name << ")" << std::endl;
 		}
+		return -1;
 	}
 
-	std::cerr << "[dpdk] Could not find created virtio-user port" << std::endl;
-	return -1;
+	virtio_port_id = port_id;
+	std::cout << "[dpdk] virtio-user port found with ID: " << port_id << std::endl;
+	
+	// Initialize the virtio-user port
+	struct rte_eth_conf virt_conf = {};
+	if (rte_eth_dev_configure(port_id, 1, 1, &virt_conf) < 0) {
+		std::cerr << "[dpdk] Failed to configure virtio-user port" << std::endl;
+		return -1;
+	}
+	
+	if (rte_eth_rx_queue_setup(port_id, 0, RX_RING_SIZE,
+			rte_eth_dev_socket_id(port_id), NULL, mbuf_pool) < 0) {
+		std::cerr << "[dpdk] Failed to setup RX queue for virtio-user" << std::endl;
+		return -1;
+	}
+	
+	if (rte_eth_tx_queue_setup(port_id, 0, TX_RING_SIZE,
+			rte_eth_dev_socket_id(port_id), NULL) < 0) {
+		std::cerr << "[dpdk] Failed to setup TX queue for virtio-user" << std::endl;
+		return -1;
+	}
+	
+	if (rte_eth_dev_start(port_id) < 0) {
+		std::cerr << "[dpdk] Failed to start virtio-user port" << std::endl;
+		return -1;
+	}
+	
+	std::cout << "[dpdk] virtio-user port started successfully" << std::endl;
+	return 0;
 }
 int main(int argc, char** argv) {
     // signal init
@@ -434,12 +468,20 @@ int main(int argc, char** argv) {
     // launch worker thread
     rte_eal_mp_remote_launch(lcore_loop, NULL, SKIP_MAIN);
 
-    // maste thread do nothing
+    // master thread do nothing
     while (1) {
         if (!g_running)
             break;
-        usleep(0);
+        usleep(100000); // 100ms
     }
+    
+    // Wait for worker threads to finish
+    rte_eal_mp_wait_lcore();
+    
+    // Cleanup resources
+    cleanup_resources();
+    
+    std::cout << "[dpdk] Application exiting cleanly" << std::endl;
     return 0;
 }
 
